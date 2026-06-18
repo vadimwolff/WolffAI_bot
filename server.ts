@@ -147,9 +147,9 @@ async function startServer() {
 
       ctx.reply(
         `👋 Привет, <b>${ctx.from.first_name}</b>! Я <b>WolffAi</b> — твой умный ИИ.\n\n` + 
-        `Я надёжно изолирую и храню твои чаты, генерирую код, картинки и думаю над сложными задачами!\n\n` +
+        `Я надёжно изолирую и храню твои чаты, генерирую код и думаю над сложными задачами!\n\n` +
         `🛠 <b>Команды:</b>\n` +
-        `• /mode — Режим работы (⚡Быстрый 🧠Мышление 💻Код 🔍Поиск)\n` +
+        `• /mode — Режим работы (⚡Быстрый 🧠Мышление 🔍Поиск)\n` +
         `• /newchat [название] — Создать новый чат\n` +
         `• /chats — Список твоих чатов\n` +
         `• /clear — Очистить текущий чат\n` + 
@@ -225,7 +225,7 @@ async function startServer() {
           parse_mode: "HTML",
           ...Markup.inlineKeyboard([
             [Markup.button.callback("⚡ Быстрый", "mode_fast"), Markup.button.callback("🧠 Мышление", "mode_thinking")],
-            [Markup.button.callback("💻 Код", "mode_code"), Markup.button.callback("🔍 Поиск", "mode_search")]
+            [Markup.button.callback("🔍 Поиск", "mode_search")]
           ])
         });
       } catch (err) {
@@ -390,16 +390,14 @@ async function startServer() {
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
         if (u.mode === "thinking") {
-            model = "gemma-4-26b";
+            model = "gemini-3.5-flash";
             sysInst += " Глубоко продумывай и аргументируй ответ.";
         } else if (u.mode === "search") {
            model = "gemini-3.1-flash-lite";
            tools = [{ googleSearch: {} }];
-        } else if (u.mode === "code") {
-           model = "gemma-4-26b";
-           sysInst += " Приводи рабочий код и лучшие практики.";
         }
 
+        let replyText = "";
         try {
           const response = await ai.models.generateContent({
              model,
@@ -409,31 +407,50 @@ async function startServer() {
                tools: tools
              }
           });
-
-          const replyText = response.text || "Нет ответа.";
-          
-          chat.history.push({ role: "model", parts: [{ text: replyText }] });
-          saveDB();
-
-          const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
-          await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
-            await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
-          });
+          replyText = response.text || "Нет ответа.";
         } catch (genErr: any) {
            console.error("Gemini Generation Error:", genErr);
-           chat.history.pop(); // Revert user query to not corrupt history
-           // Attempt a fallback if the selected model failed
-           let errorDesc = "❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.";
+           let retrySuccess = false;
            if (genErr.message) {
                const msg = genErr.message.toLowerCase();
-               if (msg.includes("not found")) {
-                   errorDesc = "❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.";
-               } else if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
-                   errorDesc = "❌ Вы исчерпали лимиты запросов у провайдера ИИ (Google API). Попробуйте позже или используйте другой тариф.";
+               if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
+                   console.log("Limit reached. Falling back to gemma-4-26b");
+                   try {
+                      const fallbackResponse = await ai.models.generateContent({
+                         model: "gemma-4-26b",
+                         contents: chat.history,
+                         config: { systemInstruction: sysInst }
+                      });
+                      replyText = fallbackResponse.text || "Нет ответа.";
+                      retrySuccess = true;
+                   } catch (fallbackErr) {
+                      console.error("Fallback failed:", fallbackErr);
+                   }
                }
            }
-           ctx.reply(errorDesc);
+
+           if (!retrySuccess) {
+               chat.history.pop(); // Revert user query to not corrupt history
+               let errorDesc = "❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.";
+               if (genErr.message) {
+                   const msg = genErr.message.toLowerCase();
+                   if (msg.includes("not found")) {
+                       errorDesc = "❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.";
+                   } else if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
+                       errorDesc = "❌ Вы исчерпали лимиты запросов у провайдера ИИ (Google API). Попробуйте позже или используйте другой тариф.";
+                   }
+               }
+               return ctx.reply(errorDesc);
+           }
         }
+
+        chat.history.push({ role: "model", parts: [{ text: replyText }] });
+        saveDB();
+
+        const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
+        await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+          await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
+        });
       } catch (err: any) {
         console.error("General Handler Error:", err);
         ctx.reply("❌ Произошла системная ошибка. Попробуйте очистить контекст: /clear");
