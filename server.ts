@@ -408,14 +408,14 @@ async function startServer() {
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
         if (u.mode === "search") {
-           model = "gemma-4-26b";
+           model = "gemma-4-26b-a4b-it";
            tools = [{ googleSearch: {} }];
         } else if (u.mode === "thinking") {
            model = "gemini-3.5-flash";
            sysInst += " Глубоко продумывай и аргументируй ответ.";
         } else {
            if (!u.isSubscribed && (u.messagesFast || 0) > 20) {
-              model = "gemma-4-26b"; // fallback for fast mode
+              model = "gemma-4-26b-a4b-it"; // fallback for fast mode
            }
         }
 
@@ -436,10 +436,10 @@ async function startServer() {
            if (genErr.message) {
                const msg = genErr.message.toLowerCase();
                if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
-                   console.log("Limit reached. Falling back to gemma-4-26b");
+                   console.log("Limit reached. Falling back to gemma-4-26b-a4b-it");
                    try {
                       const fallbackResponse = await ai.models.generateContent({
-                         model: "gemma-4-26b",
+                         model: "gemma-4-26b-a4b-it",
                          contents: chat.history,
                          config: { systemInstruction: sysInst }
                       });
