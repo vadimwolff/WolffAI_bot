@@ -9,7 +9,12 @@ import fs from "fs";
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "users.json");
 
-// Define database schema
+interface ChatSession {
+  id: string;
+  name: string;
+  history: Array<{ role: 'user' | 'model', parts: Array<any> }>;
+}
+
 interface User {
   id: number;
   username?: string;
@@ -18,15 +23,16 @@ interface User {
   referredBy?: number;
   joinedAt: string;
   mode: 'fast' | 'thinking' | 'code' | 'search';
+  modelPreference: 'gemini-2' | 'gemini-3';
   messagesToday: number;
   lastMessageDate: string;
   isSubscribed: boolean;
-  history: Array<{ role: 'user' | 'model', parts: Array<any> }>;
+  chats: Record<string, ChatSession>;
+  currentChatId: string;
 }
 
 let users: Record<string, User> = {};
 
-// Load DB
 if (fs.existsSync(DB_FILE)) {
   try {
     const data = fs.readFileSync(DB_FILE, "utf-8");
@@ -36,13 +42,12 @@ if (fs.existsSync(DB_FILE)) {
   }
 }
 
-// Save DB function
-const saveDB = () => {
-  fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
-};
+const saveDB = () => fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 
 const getInitUser = (ctx: any): User => {
   const userId = ctx.from.id;
+  const defaultChatId = Date.now().toString();
+  
   if (!users[userId]) {
     users[userId] = {
       id: userId,
@@ -51,19 +56,40 @@ const getInitUser = (ctx: any): User => {
       refCount: 0,
       joinedAt: new Date().toISOString(),
       mode: 'fast',
+      modelPreference: 'gemini-3',
       messagesToday: 0,
       lastMessageDate: new Date().toISOString().split('T')[0],
       isSubscribed: false,
-      history: []
+      chats: {
+        [defaultChatId]: { id: defaultChatId, name: "Новый чат", history: [] }
+      },
+      currentChatId: defaultChatId
     };
   }
   
-  // ensure new fields exist for old users
-  if (!users[userId].mode) users[userId].mode = 'fast';
-  if (users[userId].messagesToday === undefined) users[userId].messagesToday = 0;
-  if (!users[userId].lastMessageDate) users[userId].lastMessageDate = new Date().toISOString().split('T')[0];
-  if (users[userId].isSubscribed === undefined) users[userId].isSubscribed = false;
-  if (!users[userId].history) users[userId].history = [];
+  const u = users[userId];
+  
+  if (!u.mode) u.mode = 'fast';
+  if (!u.modelPreference) u.modelPreference = 'gemini-3';
+  if (u.messagesToday === undefined) u.messagesToday = 0;
+  if (!u.lastMessageDate) u.lastMessageDate = new Date().toISOString().split('T')[0];
+  if (u.isSubscribed === undefined) u.isSubscribed = false;
+  
+  if (!u.chats) {
+    const oldHistory = (u as any).history || [];
+    u.chats = {
+      [defaultChatId]: { id: defaultChatId, name: "Первый чат", history: oldHistory }
+    };
+    u.currentChatId = defaultChatId;
+    delete (u as any).history;
+  }
+  
+  if (!u.chats[u.currentChatId]) {
+     u.currentChatId = Object.keys(u.chats)[0] || defaultChatId;
+     if (!u.chats[u.currentChatId]) {
+         u.chats[u.currentChatId] = { id: u.currentChatId, name: "Новый чат", history: [] };
+     }
+  }
   
   saveDB();
   return users[userId];
@@ -85,7 +111,6 @@ const checkLimit = (user: User): boolean => {
 async function startServer() {
   const app = express();
 
-  // --- BOT INITIALIZATION ---
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const geminiKey = process.env.GEMINI_API_KEY;
   const adminIdStr = process.env.ADMIN_TELEGRAM_ID;
@@ -93,20 +118,16 @@ async function startServer() {
   let bot: Telegraf | null = null;
   let ai: GoogleGenAI | null = null;
 
-  if (geminiKey) {
-    ai = new GoogleGenAI({ apiKey: geminiKey });
-  } else {
-    console.warn("GEMINI_API_KEY is not set. Bot AI will fail.");
-  }
+  if (geminiKey) ai = new GoogleGenAI({ apiKey: geminiKey });
+  else console.warn("GEMINI_API_KEY is not set.");
 
   if (botToken) {
     bot = new Telegraf(botToken);
 
-    // Command: /start
     bot.start((ctx) => {
       const u = getInitUser(ctx);
       const userId = ctx.from.id;
-      const refPayload = ctx.payload; // from /start REF_ID
+      const refPayload = ctx.payload; 
       
       if (refPayload && u.refCount === 0 && u.joinedAt.startsWith(new Date().toISOString().split('T')[0])) {
         const inviterId = parseInt(refPayload, 10);
@@ -120,24 +141,66 @@ async function startServer() {
 
       ctx.reply(
         `👋 Привет, <b>${ctx.from.first_name}</b>! Я <b>WolffAi</b> — твой умный ИИ.\n\n` + 
-        `Я помню контекст беседы, отправляй мне текст или фото!\n` +
-        `• /mode - Выбрать режим (Мышление, Поиск, Код)\n` +
-        `• /clear - Очистить контекст\n` + 
-        `• /buy - Безлимитный PRO (Stars)\n` + 
-        `• /referral - Пригласить друзей`,
+        `Я надёжно изолирую и храню твои чаты, генерирую код, картинки и думаю над сложными задачами!\n\n` +
+        `🛠 <b>Команды:</b>\n` +
+        `• /mode — Режим работы (⚡Быстрый 🧠Мышление 💻Код 🔍Поиск)\n` +
+        `• /model — Версия (Gemini 2 ↔ Gemini 3)\n` +
+        `• /image [текст] — Создать картинку\n` +
+        `• /newchat [название] — Создать новый чат\n` +
+        `• /chats — Список твоих чатов\n` +
+        `• /clear — Очистить текущий чат\n` + 
+        `• /buy — Безлимитный PRO\n` + 
+        `• /promo [код] — Ввести промокод\n` +
+        `• /referral — Пригласить друзей\n`,
         { parse_mode: "HTML" }
       ).catch(console.error);
     });
 
-    // Command: /clear
     bot.command("clear", (ctx) => {
       const u = getInitUser(ctx);
-      u.history = [];
+      u.chats[u.currentChatId].history = [];
       saveDB();
-      ctx.reply("🧹 Контекст беседы очищен! Начинаем с чистого листа.");
+      ctx.reply("🧹 Контекст текущего чата очищен!");
     });
 
-    // Command: /mode
+    bot.command("newchat", (ctx) => {
+      const u = getInitUser(ctx);
+      const parts = ctx.message.text.split(" ");
+      parts.shift();
+      const name = parts.length > 0 ? parts.join(" ") : `Чат ${Object.keys(u.chats).length + 1}`;
+      
+      const newId = Date.now().toString();
+      u.chats[newId] = { id: newId, name, history: [] };
+      u.currentChatId = newId;
+      saveDB();
+      ctx.reply(`✅ Создан и выбран новый чат: <b>${name}</b>`, { parse_mode: "HTML" });
+    });
+
+    bot.command("chats", (ctx) => {
+      const u = getInitUser(ctx);
+      const chatList = Object.values(u.chats);
+      
+      const buttons = chatList.map(c => {
+         const prefix = c.id === u.currentChatId ? "👉 " : "";
+         return [Markup.button.callback(`${prefix}${c.name}`, `switchchat_${c.id}`)];
+      });
+      
+      ctx.reply(`Ваши активные чаты (текущий выделен):`, Markup.inlineKeyboard(buttons));
+    });
+
+    bot.action(/switchchat_(.*)/, (ctx) => {
+      const u = getInitUser(ctx);
+      const chatId = ctx.match[1];
+      if (u.chats[chatId]) {
+         u.currentChatId = chatId;
+         saveDB();
+         ctx.answerCbQuery(`Чат переключен на ${u.chats[chatId].name}`);
+         ctx.editMessageText(`✅ Вы переключились на чат: <b>${u.chats[chatId].name}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+      } else {
+         ctx.answerCbQuery(`Чат не найден`);
+      }
+    });
+
     bot.command("mode", (ctx) => {
       const u = getInitUser(ctx);
       ctx.reply(`Текущий режим: <b>${u.mode}</b>\nВыберите новый режим:`, {
@@ -154,11 +217,29 @@ async function startServer() {
       const newMode = ctx.match[1] as any;
       u.mode = newMode;
       saveDB();
-      ctx.answerCbQuery(`Режим изменен: ${newMode}`);
+      ctx.answerCbQuery(`Режим: ${newMode}`);
       ctx.editMessageText(`✅ Режим работы изменен на: <b>${newMode}</b>`, { parse_mode: "HTML" }).catch(()=>{});
     });
 
-    // Command: /referral
+    bot.command("model", (ctx) => {
+      const u = getInitUser(ctx);
+      ctx.reply(`Текущая версия модели: <b>${u.modelPreference === 'gemini-3' ? 'Gemini 3 ⭐' : 'Gemini 2'}</b>\nВыберите версию ИИ:`, {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("Gemini 2", "setmodel_gemini-2"), Markup.button.callback("Gemini 3 ⭐", "setmodel_gemini-3")]
+        ])
+      });
+    });
+
+    bot.action(/setmodel_(.*)/, (ctx) => {
+      const u = getInitUser(ctx);
+      const newModel = ctx.match[1] as any;
+      u.modelPreference = newModel;
+      saveDB();
+      ctx.answerCbQuery(`Модель изменена: ${newModel}`);
+      ctx.editMessageText(`✅ Версия модели изменена на: <b>${newModel === 'gemini-3' ? 'Gemini 3 ⭐' : 'Gemini 2'}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+    });
+
     bot.command("referral", async (ctx) => {
       const u = getInitUser(ctx);
       const botUsername = ctx.botInfo?.username || "ТвойБот";
@@ -168,12 +249,11 @@ async function startServer() {
         `🔗 <b>Твоя реферальная программа</b>\n\n` +
         `Приглашено друзей: <b>${u.refCount}</b>\n\n` +
         `Отправь эту ссылку:\n${refLink}\n` + 
-        `<i>Зарабатывай награды (в разработке).</i>`,
+        `<i>Зарабатывай крутые бонусы.</i>`,
         { parse_mode: "HTML" }
       ).catch(console.error);
     });
 
-    // Command: /promo
     bot.command("promo", (ctx) => {
       const u = getInitUser(ctx);
       const parts = ctx.message.text.split(" ");
@@ -181,23 +261,26 @@ async function startServer() {
       
       const code = parts[1].toUpperCase();
       if (code === "MAXVERSTAPPENBEST" || code === "KOSTASDEBIL") {
-         u.isSubscribed = true;
-         saveDB();
-         ctx.reply("🎉 Промокод применен! У вас теперь БЕЗЛИМИТНЫЙ PRO статус.");
+         if (!u.isSubscribed) {
+           u.isSubscribed = true;
+           saveDB();
+           ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: генерация картинок, Gemini 3, без ограничений по количеству сообщений.");
+         } else {
+           ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
+         }
       } else {
-         ctx.reply("❌ Неверный промокод.");
+         ctx.reply("❌ Промокод отклонён. Проверьте правильность ввода.");
       }
     });
 
-    // Command: /buy (Telegram Stars)
     bot.command("buy", (ctx) => {
       ctx.replyWithInvoice({
         title: "Подписка PRO",
-        description: "Безлимитный доступ, все режимы ИИ и возможности.",
+        description: "Безлимитный доступ, генерация картинок, все режимы.",
         payload: "sub_1_month",
-        provider_token: "", // Native Telegram Stars
+        provider_token: "",
         currency: "XTR",
-        prices: [{ label: "1 месяц", amount: 150 }] // 150 Telegram Stars
+        prices: [{ label: "1 месяц", amount: 150 }]
       }).catch(e => console.error("Invoice Error:", e));
     });
 
@@ -212,6 +295,40 @@ async function startServer() {
       await ctx.reply("🎉 Оплата (Stars) успешна! Твой PRO доступ активирован навсегда!");
     });
 
+    bot.command("image", async (ctx) => {
+      const u = getInitUser(ctx);
+      if (!checkLimit(u)) return ctx.reply("❌ Лимит исчерпан. Повторите попытку завтра или приобретите подписку: /buy");
+      
+      const prompt = ctx.message.text.replace("/image", "").trim();
+      if (!prompt) return ctx.reply("Формат: /image [описание картинки]");
+      
+      if (!ai) return ctx.reply("ИИ отключен.");
+      
+      ctx.sendChatAction("upload_photo");
+      try {
+        const response = await ai.models.generateImages({
+            model: 'imagen-3.0-generate-002',
+            prompt: prompt,
+            config: {
+                numberOfImages: 1,
+                aspectRatio: "1:1",
+                outputMimeType: "image/jpeg"
+            }
+        });
+        const base64Image = response.generatedImages?.[0]?.image?.imageBytes;
+        if (base64Image) {
+           await ctx.replyWithPhoto({ source: Buffer.from(base64Image, 'base64') }, {
+              caption: `🖼 Сгенерировано для вас!\n\n💎 Купить PRO: /buy | 🔗 Рефералы: /referral`
+           });
+        } else {
+           ctx.reply("❌ Не удалось сгенерировать изображение.");
+        }
+      } catch (err) {
+        console.error("Image Error:", err);
+        ctx.reply("❌ Ошибка при генерации картинки. Запрос отклонён политикой безопасности.");
+      }
+    });
+
     bot.command("broadcast", async (ctx) => {
       if (!adminIdStr || String(ctx.from.id) !== adminIdStr.trim()) return;
       const text = ctx.message.text.replace("/broadcast", "").trim();
@@ -219,14 +336,13 @@ async function startServer() {
       let s = 0, f = 0;
       for (const uid of Object.keys(users)) {
         try {
-          await ctx.telegram.sendMessage(uid, `📢 <b>Рассылка:</b>\n${text}`, { parse_mode: "HTML" });
-          s++;
+           await ctx.telegram.sendMessage(uid, `📢 <b>Рассылка:</b>\n${text}`, { parse_mode: "HTML" });
+           s++;
         } catch(e) { f++; }
       }
       ctx.reply(`✅ Рассылка: ${s} успешно, ${f} ошибок`);
     });
 
-    // Main AI Engine Handler
     const handleInput = async (ctx: any, text: string) => {
       const u = getInitUser(ctx);
       
@@ -255,25 +371,31 @@ async function startServer() {
 
         if (parts.length === 0) return;
 
-        u.history.push({ role: "user", parts });
-        if (u.history.length > 10) u.history = u.history.slice(u.history.length - 10);
+        const chat = u.chats[u.currentChatId];
+        chat.history.push({ role: "user", parts });
+        if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-2.5-flash";
-        let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко, русском.";
+        let model = "";
+        let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
+
+        if (u.modelPreference === "gemini-3") {
+            model = u.mode === "thinking" ? "gemini-3.1-pro-preview" : "gemini-3.0-flash";
+        } else {
+            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash";
+        }
 
         if (u.mode === "search") {
            tools = [{ googleSearch: {} }];
         } else if (u.mode === "thinking") {
-           model = "gemini-2.5-pro";
-           sysInst = "Ты WolffAi, мощный аналитик. Глубоко продумывай ответ.";
+           sysInst = "Ты WolffAi, мощный аналитик. Глубоко продумывай и аргументируй ответ.";
         } else if (u.mode === "code") {
-           sysInst = "Ты WolffAi Senior Кодер. Приводи код, лучшие практики.";
+           sysInst = "Ты WolffAi Senior Кодер. Приводи рабочий код, лучшие практики.";
         }
 
         const response = await ai.models.generateContent({
            model,
-           contents: u.history,
+           contents: chat.history,
            config: { 
              systemInstruction: sysInst,
              tools: tools
@@ -282,17 +404,18 @@ async function startServer() {
 
         const replyText = response.text || "Нет ответа.";
         
-        u.history.push({ role: "model", parts: [{ text: replyText }] });
+        chat.history.push({ role: "model", parts: [{ text: replyText }] });
         saveDB();
 
-        const adBlock = `\n\n---\n🚀 <b>Спонсор</b>: <a href="https://t.me/">Запустить свой проект</a>`;
-        await ctx.reply(replyText + adBlock, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
-          await ctx.reply(replyText + "\n\n--- Спонсор: https://t.me/");
+        const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
+        await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+          await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
         });
 
       } catch (err: any) {
         console.error("Gemini Error:", err);
-        u.history.pop(); // Revert user query to not corrupt history
+        const chat = u.chats[u.currentChatId];
+        chat.history.pop();
         ctx.reply("❌ Произошла ошибка. Слишком сложный запрос (или переполнение контекста). Попробуйте написать короче или /clear");
       }
     };
@@ -308,7 +431,6 @@ async function startServer() {
     console.log("TELEGRAM_BOT_TOKEN missing");
   }
 
-  // --- EXPRESS ROUTES ---
   app.get("/api/stats", (req, res) => {
     res.json({
       totalUsers: Object.keys(users).length,
