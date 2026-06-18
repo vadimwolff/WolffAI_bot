@@ -435,8 +435,8 @@ async function startServer() {
            let retrySuccess = false;
            if (genErr.message) {
                const msg = genErr.message.toLowerCase();
-               if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
-                   console.log("Limit reached. Falling back to gemma-4-26b-a4b-it");
+               if (msg.includes("limit") || msg.includes("429") || msg.includes("quota") || msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
+                   console.log("Limit / 503 reached. Falling back to gemma-4-26b-a4b-it");
                    try {
                       const fallbackResponse = await ai.models.generateContent({
                          model: "gemma-4-26b-a4b-it",
@@ -460,6 +460,8 @@ async function startServer() {
                        errorDesc = "❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.";
                    } else if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
                        errorDesc = "❌ Вы исчерпали лимиты запросов у провайдера ИИ (Google API). Попробуйте позже или используйте другой тариф.";
+                   } else if (msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
+                       errorDesc = "❌ Выбранная модель перегружена (Google API 503). Пожалуйста, повторите запрос чуть позже.";
                    }
                }
                return ctx.reply(errorDesc);

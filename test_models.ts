@@ -4,20 +4,20 @@ dotenv.config();
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-async function testModel(modelName: string, tools?: any) {
-  try {
-    const response = await ai.models.generateContent({
-      model: modelName,
-      contents: "Hello",
-      config: tools ? { tools } : undefined
-    });
-    console.log(`${modelName} success:`, response.text?.substring(0, 20));
-  } catch (e: any) {
-    console.error(`${modelName} error:`, e.message);
-  }
-}
-
 async function run() {
-  await testModel("gemma-4-26b-a4b-it", [{ googleSearch: {} }]);
+  try {
+    let tools = undefined;
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: "Привет",
+      config: {
+        systemInstruction: "Ты WolffAi",
+        tools: tools
+      }
+    });
+    console.log("SUCCESS:", response.text);
+  } catch (e: any) {
+    console.error("ERROR:", e.message);
+  }
 }
 run();
