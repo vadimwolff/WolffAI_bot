@@ -25,6 +25,9 @@ interface User {
   mode: 'fast' | 'thinking' | 'code' | 'search';
   modelPreference: 'gemini-2' | 'gemini-3';
   messagesToday: number;
+  messagesFast?: number;
+  messagesThinking?: number;
+  messagesSearch?: number;
   lastMessageDate: string;
   isSubscribed: boolean;
   chats: Record<string, ChatSession>;
@@ -72,6 +75,9 @@ const getInitUser = (ctx: any): User => {
   if (!u.mode) u.mode = 'fast';
   if (!u.modelPreference) u.modelPreference = 'gemini-3';
   if (u.messagesToday === undefined) u.messagesToday = 0;
+  if (u.messagesFast === undefined) u.messagesFast = 0;
+  if (u.messagesThinking === undefined) u.messagesThinking = 0;
+  if (u.messagesSearch === undefined) u.messagesSearch = 0;
   if (!u.lastMessageDate) u.lastMessageDate = new Date().toISOString().split('T')[0];
   if (u.isSubscribed === undefined) u.isSubscribed = false;
   
@@ -95,15 +101,27 @@ const getInitUser = (ctx: any): User => {
   return users[userId];
 }
 
-const checkLimit = (user: User): boolean => {
-  if (user.isSubscribed) return true;
+const checkLimit = (user: User, mode: string): boolean => {
   const today = new Date().toISOString().split('T')[0];
   if (user.lastMessageDate !== today) {
     user.messagesToday = 0;
+    user.messagesFast = 0;
+    user.messagesThinking = 0;
+    user.messagesSearch = 0;
     user.lastMessageDate = today;
   }
-  if (user.messagesToday >= 10) return false;
-  user.messagesToday += 1;
+  
+  if (mode === 'thinking') {
+     const thinkingLimit = user.isSubscribed ? 100 : 5;
+     if ((user.messagesThinking || 0) >= thinkingLimit) return false;
+     user.messagesThinking = (user.messagesThinking || 0) + 1;
+  } else if (mode === 'search') {
+     if (!user.isSubscribed && (user.messagesSearch || 0) >= 50) return false;
+     user.messagesSearch = (user.messagesSearch || 0) + 1;
+  } else {
+     user.messagesFast = (user.messagesFast || 0) + 1;
+  }
+  
   saveDB();
   return true;
 }
@@ -290,8 +308,8 @@ async function startServer() {
 
     bot.command("buy", (ctx) => {
       ctx.replyWithInvoice({
-        title: "Подписка PRO",
-        description: "Безлимитный доступ, все режимы.",
+        title: "Подписка PRO (1 месяц)",
+        description: "Безлимитный доступ (150 рублей в месяц). Оплата Telegram Stars (пополняются картой или монетами TON).",
         payload: "sub_1_month",
         provider_token: "",
         currency: "XTR",
@@ -307,7 +325,7 @@ async function startServer() {
       const u = getInitUser(ctx);
       u.isSubscribed = true;
       saveDB();
-      await ctx.reply("🎉 Оплата (Stars) успешна! Твой PRO доступ активирован навсегда!");
+      await ctx.reply("🎉 Оплата успешна! Твой PRO доступ активирован на 1 месяц!");
     });
 
     bot.command("kostas", async (ctx) => {
@@ -356,8 +374,8 @@ async function startServer() {
          return;
       }
       
-      if (!checkLimit(u)) {
-        return ctx.reply("❌ Дневной лимит 10 сообщений исчерпан( Купите подписку командой /buy или введите /promo");
+      if (!checkLimit(u, u.mode)) {
+        return ctx.reply("❌ Дневной лимит для этого режима исчерпан. Переключите режим или купите PRO: /buy");
       }
 
       if (!ai) return ctx.reply("ИИ отключен сервером.");
@@ -386,15 +404,19 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-3.1-flash-lite";
+        let model = "gemini-3.1-flash-lite"; // By default, fast
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
-        if (u.mode === "thinking") {
-            model = "gemini-3.5-flash";
-            sysInst += " Глубоко продумывай и аргументируй ответ.";
-        } else if (u.mode === "search") {
-           model = "gemini-3.1-flash-lite";
+        if (u.mode === "search") {
+           model = "gemma-4-26b";
            tools = [{ googleSearch: {} }];
+        } else if (u.mode === "thinking") {
+           model = "gemini-3.5-flash";
+           sysInst += " Глубоко продумывай и аргументируй ответ.";
+        } else {
+           if (!u.isSubscribed && (u.messagesFast || 0) > 20) {
+              model = "gemma-4-26b"; // fallback for fast mode
+           }
         }
 
         let replyText = "";
