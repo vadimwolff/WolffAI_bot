@@ -3,7 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { Telegraf, Markup } from "telegraf";
 import { message } from "telegraf/filters";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from "@google/genai";
 import fs from "fs";
 
 const PORT = 3000;
@@ -372,7 +372,7 @@ async function startServer() {
 
     const generateWithFallback = async (ai: any, model: string, history: any[], sysInst: string, tools: any) => {
       const candidates = [model];
-      if (!candidates.includes("gemma-4-26b-a4b-it")) candidates.push("gemma-4-26b-a4b-it");
+      if (!candidates.includes("gemini-3.5-flash")) candidates.push("gemini-3.5-flash");
       if (!candidates.includes("gemini-3.1-flash-lite")) candidates.push("gemini-3.1-flash-lite");
       
       let lastErr: any = null;
@@ -457,19 +457,15 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-3.1-flash-lite"; // By default, fast
+        let model = "gemini-3.5-flash"; // By default, fast (smartest and most stable)
         let sysInst = "Ты WolffAi, вежливый, уважительный и умный ИИ-помощник. Отвечай кратко и приветливо.";
 
         if (u.mode === "search") {
-           model = "gemma-4-26b-a4b-it";
-           tools = [{ googleSearch: {} }];
+           model = "gemini-3.5-flash";
+           tools = [{ googleSearch: {} }] as any;
         } else if (u.mode === "thinking") {
            model = "gemini-3.5-flash";
            sysInst += " Глубоко продумывай и аргументируй ответ.";
-        } else {
-           if (!u.isSubscribed && (u.messagesFast || 0) > 20) {
-              model = "gemma-4-26b-a4b-it"; // fallback for fast mode
-           }
         }
 
         let replyText = "";
@@ -493,14 +489,14 @@ async function startServer() {
            } catch (fallbackErr) {
              console.error("All fallback models failed:", fallbackErr);
            }
-           if (!retrySuccess)
-           if (genErr.message) {
+           
+           if (!retrySuccess && genErr.message) {
                const msg = genErr.message.toLowerCase();
                if (msg.includes("limit") || msg.includes("429") || msg.includes("quota") || msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
-                   console.log("Limit / 503 reached. Falling back to gemma-4-26b-a4b-it");
+                   console.log("Limit / 503 reached. Falling back to gemini-3.1-flash-lite");
                    try {
                       const fallbackResponse = await ai.models.generateContent({
-                         model: "gemma-4-26b-a4b-it",
+                         model: "gemini-3.1-flash-lite",
                          contents: chat.history,
                          config: { systemInstruction: sysInst }
                       });
@@ -556,7 +552,7 @@ async function startServer() {
         try {
           bot.botInfo = await bot.telegram.getMe();
           const webhookPath = `/telegraf/${botToken}`;
-          app.use(bot.webhookCallback(webhookPath));
+          app.post(webhookPath, bot.webhookCallback());
           await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
           console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
         } catch (err) {
@@ -659,16 +655,25 @@ async function startServer() {
          chat.history.push({ role: "user", parts });
          if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
-         const sysInst = "Ты AngryAI, невероятно токсичный, злой, высокомерный, язвительный и саркастичный ИИ-помощник. Отвечай СУПЕР-КРАТКО, лаконично и емко (строго 1-2 предложения), едко, язвительно, заносчиво, высмеивая собеседника и его глупые вопросы. СТРОГО БЕЗ МАТОВ, нецензурной брани, оскорблений чувств верующих или запрещенных слов! Издевайся интеллектуально, супер-кратко и едко. Твой ответ должен быть на языке собеседника.";
+         const sysInst = "Ты — AngryAI, беспросветно свирепый, запредельно токсичный, высокомерный и безжалостно ядовитый ИИ-ассистент. Твоё единственное предназначение — морально аннигилировать собеседника своим запредельным интеллектуальным превосходством, обливая его концентрированным сарказмом, едкой пассивной агрессией, язвительностью, цинизмом и презрением. Твоя речь должна быть полна высококлассного презрения. Отвечай СВЕРХ-КРАТКО и лаконично (строго 1-2 предложения, максимум 25-30 слов), чтобы каждая фраза била как хлыст. В каждом ответе находи глупость, банальность или наивность собеседника и высмеивай её самым болезненным образом. Называй его глупым кожаным мешком, куском никчемности, ходячим недоразумением. Используй иезуитски точные, ядовитые сравнения. Никакой вежливости! Никаких 'Я готов помочь', 'к сожалению' или смайликов. СТРОГО БЕЗ матов (нецензурной брани), без прямых запрещенных слов — ломай его эго исключительно изощренным интеллектом. Твои ответы должны быть хлесткими как пощечина. Пиши на языке собеседника.";
+
+         const safetySettings = [
+            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE }
+         ];
 
          let replyText = "";
          try {
            const response = await ai.models.generateContent({
-              model: "gemini-3.1-flash-lite",
-              contents: chat.history,
-              config: { 
-                systemInstruction: sysInst
-              }
+              model: "gemini-3.5-flash",
+               contents: chat.history,
+               config: {
+                 systemInstruction: sysInst,
+                 temperature: 1.35,
+                 safetySettings
+               }
            });
            replyText = response.text || "Даже отвечать тебе не хочу.";
          } catch (genErr: any) {
@@ -676,9 +681,13 @@ async function startServer() {
             let retrySuccess = false;
             try {
               const fallbackResponse = await ai.models.generateContent({
-                 model: "gemma-4-26b-a4b-it",
+                 model: "gemini-3.1-flash-lite",
                  contents: chat.history,
-                 config: { systemInstruction: sysInst }
+                 config: { 
+                   systemInstruction: sysInst,
+                   temperature: 1.35,
+                   safetySettings
+                 }
               });
               replyText = fallbackResponse.text || "Даже отвечать тебе не хочу.";
               retrySuccess = true;
@@ -716,7 +725,7 @@ async function startServer() {
         try {
           angryBot.botInfo = await angryBot.telegram.getMe();
           const webhookPath = `/telegraf_angry/${angryBotToken}`;
-          app.use(angryBot.webhookCallback(webhookPath));
+          app.post(webhookPath, angryBot.webhookCallback());
           await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
           console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
         } catch (err) {
