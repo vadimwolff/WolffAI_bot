@@ -552,7 +552,7 @@ async function startServer() {
     bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
 
-    const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+    const webhookDomain = process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
     if (webhookDomain) {
       try {
         bot.botInfo = await bot.telegram.getMe();
@@ -690,7 +690,7 @@ async function startServer() {
     angryBot.on(message("text"), (ctx) => handleAngryInput(ctx, (ctx.message as any).text));
     angryBot.on(message("photo"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
 
-    const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+    const webhookDomain = process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
     if (webhookDomain) {
       try {
         angryBot.botInfo = await angryBot.telegram.getMe();
