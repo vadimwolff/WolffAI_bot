@@ -101,6 +101,23 @@ const getInitUser = (ctx: any): User => {
   return users[userId];
 }
 
+const getAngryChat = (u: any): ChatSession => {
+  if (!u.angryChats) {
+    const defaultAngryChatId = "angry_" + Date.now().toString();
+    u.angryChats = {
+      [defaultAngryChatId]: { id: defaultAngryChatId, name: "Злой чат", history: [] }
+    };
+    u.currentAngryChatId = defaultAngryChatId;
+  }
+  if (!u.currentAngryChatId || !u.angryChats[u.currentAngryChatId]) {
+    u.currentAngryChatId = Object.keys(u.angryChats)[0] || ("angry_" + Date.now().toString());
+    if (!u.angryChats[u.currentAngryChatId]) {
+      u.angryChats[u.currentAngryChatId] = { id: u.currentAngryChatId, name: "Злой чат", history: [] };
+    }
+  }
+  return u.angryChats[u.currentAngryChatId];
+};
+
 const checkLimit = (user: User, mode: string): boolean => {
   const today = new Date().toISOString().split('T')[0];
   if (user.lastMessageDate !== today) {
@@ -130,10 +147,12 @@ async function startServer() {
   const app = express();
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const angryBotToken = process.env.ANGRY_TELEGRAM_BOT_TOKEN;
   const geminiKey = process.env.GEMINI_API_KEY;
   const adminIdStr = process.env.ADMIN_TELEGRAM_ID;
   
   let bot: Telegraf | null = null;
+  let angryBot: Telegraf | null = null;
   let ai: GoogleGenAI | null = null;
 
   if (geminiKey) ai = new GoogleGenAI({ apiKey: geminiKey });
@@ -351,20 +370,51 @@ async function startServer() {
       ctx.reply(`✅ Рассылка: ${s} успешно, ${f} ошибок`);
     });
 
+    const generateWithFallback = async (ai: any, model: string, history: any[], sysInst: string, tools: any) => {
+      const candidates = [model];
+      if (!candidates.includes("gemma-4-26b-a4b-it")) candidates.push("gemma-4-26b-a4b-it");
+      if (!candidates.includes("gemini-3.1-flash-lite")) candidates.push("gemini-3.1-flash-lite");
+      
+      let lastErr: any = null;
+      for (const cand of candidates) {
+        try {
+          const hasSearchTool = tools && cand.toLowerCase().includes("gemini");
+          const response = await ai.models.generateContent({
+            model: cand,
+            contents: history,
+            config: {
+              systemInstruction: sysInst,
+              tools: hasSearchTool ? tools : undefined
+            }
+          });
+          return response;
+        } catch (err: any) {
+          console.error(`Generation failed for model ${cand}:`, err);
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error("All models failed");
+    };
+
     const handleInput = async (ctx: any, text: string) => {
       // In group chats, only respond if the bot is replied to or explicitly mentioned
       if (ctx.chat?.type !== 'private') {
-         const botUsername = ctx.botInfo?.username;
+         const botUsername = ctx.botInfo?.username || "WolffAI_bot";
          const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
-         const isMentioned = botUsername && text && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+         
+         const textLower = text.toLowerCase();
+         const isMentioned = 
+            textLower.includes(`@${botUsername.toLowerCase()}`) || 
+            textLower.includes("wolff") || 
+            textLower.includes("вульф");
+
          if (!isReplyToBot && !isMentioned) {
              return;
          }
-         // Remove the bot username mention from the text so it doesn't confuse the AI
-         if (botUsername && text) {
-             const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
-             text = text.replace(mentionRegex, '').trim();
-         }
+         
+         // Remove mentions from the text so it doesn't confuse the AI
+         const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
+         text = text.replace(mentionRegex, '').replace(/wolff|вульф/ig, '').trim();
       }
       const u = getInitUser(ctx);
 
@@ -439,6 +489,14 @@ async function startServer() {
         } catch (genErr: any) {
            console.error("Gemini Generation Error:", genErr);
            let retrySuccess = false;
+           try {
+             const fallbackRes = await generateWithFallback(ai, model, chat.history, sysInst, tools);
+             replyText = fallbackRes.text || "Нет ответа.";
+             retrySuccess = true;
+           } catch (fallbackErr) {
+             console.error("All fallback models failed:", fallbackErr);
+           }
+           if (!retrySuccess)
            if (genErr.message) {
                const msg = genErr.message.toLowerCase();
                if (msg.includes("limit") || msg.includes("429") || msg.includes("quota") || msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
@@ -487,45 +545,6 @@ async function startServer() {
       }
     };
 
-    bot.on("inline_query", async (ctx) => {
-      const query = ctx.inlineQuery.query.trim();
-      if (!query) {
-        return ctx.answerInlineQuery([]);
-      }
-
-      try {
-        const u = getInitUser(ctx);
-        const ai = new GoogleGenAI({ apiKey: geminiKey });
-        
-        let modelParams = {
-            model: "gemini-3.1-flash-lite", // fastest
-            contents: query,
-            config: { 
-               systemInstruction: "Ты WolffAi, быстрый и умный помощник. Отвечай максимально кратко для ответа в чате."
-            }
-        };
-
-        const response = await ai.models.generateContent(modelParams as any);
-        const replyText = response.text || "Нет ответа.";
-
-        const result = [{
-          type: "article",
-          id: String(Date.now()),
-          title: "WolffAi: ответить",
-          description: replyText.substring(0, 80) + "...",
-          input_message_content: {
-            message_text: `<b>💬 Вопрос:</b> ${query}\n\n🤖 <b>WolffAi:</b>\n${replyText}`,
-            parse_mode: "HTML"
-          }
-        }];
-
-        await ctx.answerInlineQuery(result as any, { cache_time: 0 });
-      } catch (e: any) {
-        console.error("Inline query error:", e.message);
-        await ctx.answerInlineQuery([]);
-      }
-    });
-
     bot.catch((err, ctx) => {
        console.error(`Ooops, encountered an error for ${ctx.updateType}`, err);
     });
@@ -533,7 +552,7 @@ async function startServer() {
     bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
 
-    const webhookDomain = process.env.WEBHOOK_DOMAIN;
+    const webhookDomain = process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
     if (webhookDomain) {
       try {
         bot.botInfo = await bot.telegram.getMe();
@@ -554,6 +573,144 @@ async function startServer() {
     console.log("TELEGRAM_BOT_TOKEN missing");
   }
 
+  if (angryBotToken) {
+    angryBot = new Telegraf(angryBotToken);
+
+    angryBot.start((ctx) => {
+      ctx.reply(
+        `😡 Ну че приперся, ${ctx.from.first_name}?\n\n` +
+        `Я AngryAI. Твой самый злобный кошмар и токсичный «помощник». Матов от меня не дождешься (воспитание не позволяет), но я оболью тебя высококлассным сарказмом и пассивной агрессией.\n\n` +
+        `Задавай свои тупые вопросы, если осмелишься. 👇`,
+        { parse_mode: "HTML" }
+      ).catch(console.error);
+    });
+
+    angryBot.command("clear", (ctx) => {
+      const u = getInitUser(ctx);
+      const chat = getAngryChat(u);
+      chat.history = [];
+      saveDB();
+      ctx.reply("🧹 Ладно, стер твои жалкие писульки. Начинай ныть заново.");
+    });
+
+    const handleAngryInput = async (ctx: any, text: string) => {
+      if (ctx.chat?.type !== 'private') {
+         const botUsername = ctx.botInfo?.username || "AngryAI_bot";
+         const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
+         
+         const textLower = text.toLowerCase();
+         const isMentioned = 
+            textLower.includes(`@${botUsername.toLowerCase()}`) || 
+            textLower.includes("angry") || 
+            textLower.includes("злой");
+
+         if (!isReplyToBot && !isMentioned) {
+             return;
+         }
+         
+         const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
+         text = text.replace(mentionRegex, '').replace(/angry|злой/ig, '').trim();
+      }
+
+      const u = getInitUser(ctx);
+      if (!checkLimit(u, 'fast')) {
+         return ctx.reply("❌ Даже у моего терпения есть лимит. Ты исчерпал дневной лимит сообщений. Давай проваливай.");
+      }
+
+      if (!ai) return ctx.reply("ИИ сдох. Повезло тебе.");
+      ctx.sendChatAction("typing").catch(()=>{});
+
+      try {
+         let parts: any[] = [];
+         if (text) parts.push({ text });
+
+         if (ctx.message.photo) {
+            const photo = ctx.message.photo.pop();
+            const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+            const res = await fetch(fileLink.toString());
+            if (res.ok) {
+              const buf = await res.arrayBuffer();
+              parts.push({
+                inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: "image/jpeg" }
+              });
+            }
+         }
+
+         if (parts.length === 0) return;
+
+         const chat = getAngryChat(u);
+         chat.history.push({ role: "user", parts });
+         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
+
+         const sysInst = "Ты AngryAI, невероятно токсичный, злой, высокомерный, язвительный и саркастичный ИИ-помощник. Отвечай грубо, заносчиво, подкалывай и унижай глупость собеседника. Но СТРОГО БЕЗ МАТОВ, нецензурной брани, оскорблений чувств верующих или запрещенных слов! Издевайся интеллектуально и язвительно. Твой ответ должен быть на языке собеседника.";
+
+         let replyText = "";
+         try {
+           const response = await ai.models.generateContent({
+              model: "gemini-3.1-flash-lite",
+              contents: chat.history,
+              config: { 
+                systemInstruction: sysInst
+              }
+           });
+           replyText = response.text || "Даже отвечать тебе не хочу.";
+         } catch (genErr: any) {
+            console.error("Angry Gemini Generation Error:", genErr);
+            let retrySuccess = false;
+            try {
+              const fallbackResponse = await ai.models.generateContent({
+                 model: "gemma-4-26b-a4b-it",
+                 contents: chat.history,
+                 config: { systemInstruction: sysInst }
+              });
+              replyText = fallbackResponse.text || "Даже отвечать тебе не хочу.";
+              retrySuccess = true;
+            } catch (fallbackErr) {
+               console.error("Angry Fallback failed:", fallbackErr);
+            }
+
+            if (!retrySuccess) {
+                chat.history.pop();
+                return ctx.reply("❌ Ошибка генерации. Повезло тебе, твой никчемный мозг спасен от сокрушительного ответа.");
+            }
+         }
+
+         chat.history.push({ role: "model", parts: [{ text: replyText }] });
+         saveDB();
+
+         await ctx.reply(replyText, { parse_mode: "HTML" }).catch(async () => {
+           await ctx.reply(replyText);
+         });
+      } catch (err: any) {
+         console.error("Angry General Handler Error:", err);
+         ctx.reply("❌ Ой, всё сломалось. Давай плачь дальше, пока админ чинит: /clear");
+      }
+    };
+
+    angryBot.on(message("text"), (ctx) => handleAngryInput(ctx, (ctx.message as any).text));
+    angryBot.on(message("photo"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
+
+    const webhookDomain = process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+    if (webhookDomain) {
+      try {
+        angryBot.botInfo = await angryBot.telegram.getMe();
+        const webhookPath = `/telegraf_angry/${angryBotToken}`;
+        app.use(angryBot.webhookCallback(webhookPath));
+        await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+        console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
+      } catch (err) {
+        console.error("Failed to initialize Angry Bot webhook:", err);
+      }
+    } else {
+      angryBot.launch().then(() => console.log("Angry Bot started with Long Polling")).catch(console.error);
+    }
+
+    process.once("SIGINT", () => angryBot?.stop("SIGINT"));
+    process.once("SIGTERM", () => angryBot?.stop("SIGTERM"));
+  } else {
+    console.log("ANGRY_TELEGRAM_BOT_TOKEN missing");
+  }
+
   app.get("/api/health", (req, res) => {
     res.status(200).send("OK");
   });
@@ -561,7 +718,8 @@ async function startServer() {
   app.get("/api/stats", (req, res) => {
     res.json({
       totalUsers: Object.keys(users).length,
-      botActive: !!botToken
+      botActive: !!botToken,
+      angryBotActive: !!angryBotToken
     });
   });
 

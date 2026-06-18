@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "AngryAI Telegram Bot",
+  "description": "Dual Telegram Bot application supporting the original WolffAi assistant alongside a brand new highly toxic, sarcastic yet non-profane helper bot called AngryAI.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
