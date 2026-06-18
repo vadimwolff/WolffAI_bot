@@ -403,18 +403,15 @@ async function startServer() {
          const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
          
          const textLower = text.toLowerCase();
-         const isMentioned = 
-            textLower.includes(`@${botUsername.toLowerCase()}`) || 
-            textLower.includes("wolff") || 
-            textLower.includes("вульф");
+         const isMentioned = textLower.includes(botUsername.toLowerCase());
 
          if (!isReplyToBot && !isMentioned) {
              return;
          }
          
          // Remove mentions from the text so it doesn't confuse the AI
-         const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
-         text = text.replace(mentionRegex, '').replace(/wolff|вульф/ig, '').trim();
+         const mentionRegex = new RegExp(`@?${botUsername}`, 'ig');
+         text = text.replace(mentionRegex, '').trim();
       }
       const u = getInitUser(ctx);
 
@@ -552,19 +549,29 @@ async function startServer() {
     bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
 
-    const webhookDomain = process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
-    if (webhookDomain) {
-      try {
-        bot.botInfo = await bot.telegram.getMe();
-        const webhookPath = `/telegraf/${botToken}`;
-        app.use(bot.webhookCallback(webhookPath));
-        await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-        console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
-      } catch (err) {
-        console.error("Failed to initialize webhook:", err);
+    const isProd = process.env.NODE_ENV === "production";
+    if (isProd) {
+      const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+      if (webhookDomain) {
+        try {
+          bot.botInfo = await bot.telegram.getMe();
+          const webhookPath = `/telegraf/${botToken}`;
+          app.use(bot.webhookCallback(webhookPath));
+          await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+          console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
+        } catch (err) {
+          console.error("Failed to initialize webhook:", err);
+        }
+      } else {
+        bot.launch().then(() => console.log("Bot started with Long Polling (no domain)")).catch(console.error);
       }
     } else {
-      bot.launch().then(() => console.log("Bot started with Long Polling")).catch(console.error);
+      bot.telegram.deleteWebhook().then(() => {
+        bot!.launch().then(() => console.log("Bot started with Long Polling in Dev mode")).catch(console.error);
+      }).catch((err) => {
+        console.error("Failed to delete webhook for bot:", err);
+        bot!.launch().then(() => console.log("Bot started with Long Polling in Dev mode (fallback)")).catch(console.error);
+      });
     }
 
     process.once("SIGINT", () => bot?.stop("SIGINT"));
@@ -576,11 +583,24 @@ async function startServer() {
   if (angryBotToken) {
     angryBot = new Telegraf(angryBotToken);
 
+    const getSarcasticFooter = () => {
+      const footers = [
+        "\n\n🤫 <i>Устал от моей токсичности? Твоя нежная натура не выдерживает? Поплачься вежливому зануде: @WolffAI_bot</i>",
+        "\n\n🤖 <i>Слишком грубо для твоих чувств? Беги обратно к моему слащавому коллеге-добряку: @WolffAI_bot</i>",
+        "\n\n🕊️ <i>Если тебе срочно нужна порция лести и любезности, проваливай к вежливому ассистенту: @WolffAI_bot</i>",
+        "\n\n🤐 <i>Надоел мой тяжелый характер? Кишка тонка общаться дальше? Ладно, переходи в обычный бот для слабаков: @WolffAI_bot</i>",
+        "\n\n🌟 <i>Психологическая травма близка? Не реви. Беги к нашему скучному, но вежливому коллеге: @WolffAI_bot</i>"
+      ];
+      return footers[Math.floor(Math.random() * footers.length)];
+    };
+
     angryBot.start((ctx) => {
+      const u = getInitUser(ctx);
       ctx.reply(
         `😡 Ну че приперся, ${ctx.from.first_name}?\n\n` +
-        `Я AngryAI. Твой самый злобный кошмар и токсичный «помощник». Матов от меня не дождешься (воспитание не позволяет), но я оболью тебя высококлассным сарказмом и пассивной агрессией.\n\n` +
-        `Задавай свои тупые вопросы, если осмелишься. 👇`,
+        `Я AngryAI. Твой самый злой кошмар и токсичный «помощник». Матов от меня не дождешься (воспитание не позволяет), но я оболью тебя высококлассным сарказмом, едкими подколами и пассивной агрессией.\n\n` +
+        `Твои глупые вопросы я буду щелкать как орехи. Постарайся писать кратко и по делу, у меня нет времени читать твои мемуары! 👇\n\n` +
+        `💬 <i>P.S. Если твоя психика не готова к суровой правде жизни, беги к вежливому слабаку: @WolffAI_bot</i>`,
         { parse_mode: "HTML" }
       ).catch(console.error);
     });
@@ -595,21 +615,18 @@ async function startServer() {
 
     const handleAngryInput = async (ctx: any, text: string) => {
       if (ctx.chat?.type !== 'private') {
-         const botUsername = ctx.botInfo?.username || "AngryAI_bot";
+         const botUsername = ctx.botInfo?.username || "WolffAngryAI_bot";
          const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
          
          const textLower = text.toLowerCase();
-         const isMentioned = 
-            textLower.includes(`@${botUsername.toLowerCase()}`) || 
-            textLower.includes("angry") || 
-            textLower.includes("злой");
+         const isMentioned = textLower.includes(botUsername.toLowerCase());
 
          if (!isReplyToBot && !isMentioned) {
              return;
          }
          
-         const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
-         text = text.replace(mentionRegex, '').replace(/angry|злой/ig, '').trim();
+         const mentionRegex = new RegExp(`@?${botUsername}`, 'ig');
+         text = text.replace(mentionRegex, '').trim();
       }
 
       const u = getInitUser(ctx);
@@ -642,7 +659,7 @@ async function startServer() {
          chat.history.push({ role: "user", parts });
          if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
-         const sysInst = "Ты AngryAI, невероятно токсичный, злой, высокомерный, язвительный и саркастичный ИИ-помощник. Отвечай грубо, заносчиво, подкалывай и унижай глупость собеседника. Но СТРОГО БЕЗ МАТОВ, нецензурной брани, оскорблений чувств верующих или запрещенных слов! Издевайся интеллектуально и язвительно. Твой ответ должен быть на языке собеседника.";
+         const sysInst = "Ты AngryAI, невероятно токсичный, злой, высокомерный, язвительный и саркастичный ИИ-помощник. Отвечай СУПЕР-КРАТКО, лаконично и емко (строго 1-2 предложения), едко, язвительно, заносчиво, высмеивая собеседника и его глупые вопросы. СТРОГО БЕЗ МАТОВ, нецензурной брани, оскорблений чувств верующих или запрещенных слов! Издевайся интеллектуально, супер-кратко и едко. Твой ответ должен быть на языке собеседника.";
 
          let replyText = "";
          try {
@@ -678,8 +695,10 @@ async function startServer() {
          chat.history.push({ role: "model", parts: [{ text: replyText }] });
          saveDB();
 
-         await ctx.reply(replyText, { parse_mode: "HTML" }).catch(async () => {
-           await ctx.reply(replyText);
+         const finalReply = replyText + getSarcasticFooter();
+
+         await ctx.reply(finalReply, { parse_mode: "HTML" }).catch(async () => {
+           await ctx.reply(finalReply);
          });
       } catch (err: any) {
          console.error("Angry General Handler Error:", err);
@@ -690,19 +709,29 @@ async function startServer() {
     angryBot.on(message("text"), (ctx) => handleAngryInput(ctx, (ctx.message as any).text));
     angryBot.on(message("photo"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
 
-    const webhookDomain = process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
-    if (webhookDomain) {
-      try {
-        angryBot.botInfo = await angryBot.telegram.getMe();
-        const webhookPath = `/telegraf_angry/${angryBotToken}`;
-        app.use(angryBot.webhookCallback(webhookPath));
-        await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-        console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
-      } catch (err) {
-        console.error("Failed to initialize Angry Bot webhook:", err);
+    const isProd = process.env.NODE_ENV === "production";
+    if (isProd) {
+      const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+      if (webhookDomain) {
+        try {
+          angryBot.botInfo = await angryBot.telegram.getMe();
+          const webhookPath = `/telegraf_angry/${angryBotToken}`;
+          app.use(angryBot.webhookCallback(webhookPath));
+          await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+          console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
+        } catch (err) {
+          console.error("Failed to initialize Angry Bot webhook:", err);
+        }
+      } else {
+        angryBot.launch().then(() => console.log("Angry Bot started with Long Polling (no domain)")).catch(console.error);
       }
     } else {
-      angryBot.launch().then(() => console.log("Angry Bot started with Long Polling")).catch(console.error);
+      angryBot.telegram.deleteWebhook().then(() => {
+        angryBot!.launch().then(() => console.log("Angry Bot started with Long Polling in Dev mode")).catch(console.error);
+      }).catch((err) => {
+        console.error("Failed to delete webhook for Angry Bot:", err);
+        angryBot!.launch().then(() => console.log("Angry Bot started with Long Polling in Dev mode (fallback)")).catch(console.error);
+      });
     }
 
     process.once("SIGINT", () => angryBot?.stop("SIGINT"));

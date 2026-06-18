@@ -1,0 +1,75 @@
+{
+  "5358441621": {
+    "id": 5358441621,
+    "username": "VadimWolff",
+    "firstName": "Vadim",
+    "refCount": 0,
+    "joinedAt": "2026-06-18T19:10:16.200Z",
+    "mode": "fast",
+    "modelPreference": "gemini-3",
+    "messagesToday": 0,
+    "lastMessageDate": "2026-06-18",
+    "isSubscribed": false,
+    "chats": {
+      "1781809816200": {
+        "id": "1781809816200",
+        "name": "Новый чат",
+        "history": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Да ничем"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Эу"
+              }
+            ]
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Привет! Понял тебя. Если вдруг захочешь о чем-то поговорить или возникнет вопрос — я здесь и готов помочь. Хорошего дня!"
+              }
+            ]
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Привет! Понимаю, бывает такое настроение. Если вдруг захочется о чем-то поговорить или нужна будет помощь — я здесь. Хорошего тебе дня!"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "currentChatId": "1781809816200",
+    "messagesFast": 3,
+    "messagesThinking": 0,
+    "messagesSearch": 0,
+    "angryChats": {
+      "angry_1781809816262": {
+        "id": "angry_1781809816262",
+        "name": "Злой чат",
+        "history": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "😍"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "currentAngryChatId": "angry_1781809816262"
+  }
+}
