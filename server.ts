@@ -405,7 +405,7 @@ async function startServer() {
 
         let tools = undefined;
         let model = "gemini-3.1-flash-lite"; // By default, fast
-        let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
+        let sysInst = "Ты WolffAi, вежливый, уважительный и умный ИИ-помощник. Отвечай кратко и приветливо.";
 
         if (u.mode === "search") {
            model = "gemma-4-26b-a4b-it";
