@@ -486,6 +486,45 @@ async function startServer() {
       }
     };
 
+    bot.on("inline_query", async (ctx) => {
+      const query = ctx.inlineQuery.query.trim();
+      if (!query) {
+        return ctx.answerInlineQuery([]);
+      }
+
+      try {
+        const u = getInitUser(ctx);
+        const ai = new GoogleGenAI({ apiKey: geminiKey });
+        
+        let modelParams = {
+            model: "gemini-3.1-flash-lite", // fastest
+            contents: query,
+            config: { 
+               systemInstruction: "Ты WolffAi, быстрый и умный помощник. Отвечай максимально кратко для ответа в чате."
+            }
+        };
+
+        const response = await ai.models.generateContent(modelParams as any);
+        const replyText = response.text || "Нет ответа.";
+
+        const result = [{
+          type: "article",
+          id: String(Date.now()),
+          title: "WolffAi: ответить",
+          description: replyText.substring(0, 80) + "...",
+          input_message_content: {
+            message_text: `<b>💬 Вопрос:</b> ${query}\n\n🤖 <b>WolffAi:</b>\n${replyText}`,
+            parse_mode: "HTML"
+          }
+        }];
+
+        await ctx.answerInlineQuery(result as any, { cache_time: 0 });
+      } catch (e: any) {
+        console.error("Inline query error:", e.message);
+        await ctx.answerInlineQuery([]);
+      }
+    });
+
     bot.catch((err, ctx) => {
        console.error(`Ooops, encountered an error for ${ctx.updateType}`, err);
     });
