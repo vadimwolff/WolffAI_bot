@@ -488,13 +488,26 @@ async function startServer() {
     bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
 
-    bot.launch().then(() => console.log("Bot started")).catch(console.error);
+    const webhookDomain = process.env.WEBHOOK_DOMAIN;
+    if (webhookDomain) {
+      const webhookPath = `/telegraf/${botToken}`;
+      app.use(bot.webhookCallback(webhookPath));
+      bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`)
+        .then(() => console.log(`Bot started with Webhooks on ${webhookDomain}`))
+        .catch(console.error);
+    } else {
+      bot.launch().then(() => console.log("Bot started with Long Polling")).catch(console.error);
+    }
 
     process.once("SIGINT", () => bot?.stop("SIGINT"));
     process.once("SIGTERM", () => bot?.stop("SIGTERM"));
   } else {
     console.log("TELEGRAM_BOT_TOKEN missing");
   }
+
+  app.get("/api/health", (req, res) => {
+    res.status(200).send("OK");
+  });
 
   app.get("/api/stats", (req, res) => {
     res.json({
