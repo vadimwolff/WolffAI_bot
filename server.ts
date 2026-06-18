@@ -144,7 +144,7 @@ async function startServer() {
         `Я надёжно изолирую и храню твои чаты, генерирую код, картинки и думаю над сложными задачами!\n\n` +
         `🛠 <b>Команды:</b>\n` +
         `• /mode — Режим работы (⚡Быстрый 🧠Мышление 💻Код 🔍Поиск)\n` +
-        `• /model — Версия (Gemini 2 ↔ Gemini 3)\n` +
+        `• /model — Версия (Gemini 2 Flash ↔ Gemini 2 Pro)\n` +
         `• /image [текст] — Создать картинку\n` +
         `• /newchat [название] — Создать новый чат\n` +
         `• /chats — Список твоих чатов\n` +
@@ -163,114 +163,151 @@ async function startServer() {
       ctx.reply("🧹 Контекст текущего чата очищен!");
     });
 
-    bot.command("newchat", (ctx) => {
-      const u = getInitUser(ctx);
-      const text = (ctx.message as any)?.text || "";
-      const parts = text.split(" ");
-      parts.shift(); // remove command
-      const name = parts.length > 0 ? parts.join(" ") : `Чат ${Object.keys(u.chats).length + 1}`;
-      
-      const newId = Date.now().toString();
-      u.chats[newId] = { id: newId, name, history: [] };
-      u.currentChatId = newId;
-      saveDB();
-      ctx.reply(`✅ Создан и выбран новый чат: <b>${name}</b>`, { parse_mode: "HTML" }).catch(console.error);
-    });
-
-    bot.command("chats", (ctx) => {
-      const u = getInitUser(ctx);
-      const chatList = Object.values(u.chats).slice(-20); // show up to 20 recent chats
-      
-      const buttons = chatList.map(c => {
-         const prefix = c.id === u.currentChatId ? "👉 " : "";
-         return [Markup.button.callback(`${prefix}${c.name}`, `switchchat_${c.id}`)];
-      });
-      
-      ctx.reply(`Ваши активные чаты (текущий выделен):`, Markup.inlineKeyboard(buttons)).catch(console.error);
-    });
-
-    bot.action(/switchchat_(.*)/, (ctx) => {
-      const u = getInitUser(ctx);
-      const chatId = ctx.match[1];
-      if (u.chats[chatId]) {
-         u.currentChatId = chatId;
-         saveDB();
-         ctx.answerCbQuery(`Чат переключен на ${u.chats[chatId].name}`);
-         ctx.editMessageText(`✅ Вы переключились на чат: <b>${u.chats[chatId].name}</b>`, { parse_mode: "HTML" }).catch(()=>{});
-      } else {
-         ctx.answerCbQuery(`Чат не найден`);
+    bot.command("newchat", async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const text = (ctx.message as any)?.text || "";
+        const parts = text.split(" ");
+        parts.shift(); // remove command
+        const name = parts.length > 0 ? parts.join(" ") : `Чат ${Object.keys(u.chats).length + 1}`;
+        
+        const newId = Date.now().toString();
+        u.chats[newId] = { id: newId, name, history: [] };
+        u.currentChatId = newId;
+        saveDB();
+        await ctx.reply(`✅ Создан и выбран новый чат: <b>${name}</b>`, { parse_mode: "HTML" });
+      } catch (err) {
+        console.error("New Chat Error:", err);
       }
     });
 
-    bot.command("mode", (ctx) => {
-      const u = getInitUser(ctx);
-      ctx.reply(`Текущий режим: <b>${u.mode}</b>\nВыберите новый режим:`, {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback("⚡ Быстрый", "mode_fast"), Markup.button.callback("🧠 Мышление", "mode_thinking")],
-          [Markup.button.callback("💻 Код", "mode_code"), Markup.button.callback("🔍 Поиск", "mode_search")]
-        ])
-      });
+    bot.command("chats", async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const chatList = Object.values(u.chats).slice(-20); // show up to 20 recent chats
+        
+        const buttons = chatList.map(c => {
+           const prefix = c.id === u.currentChatId ? "👉 " : "";
+           return [Markup.button.callback(`${prefix}${c.name}`, `switchchat_${c.id}`)];
+        });
+        
+        await ctx.reply(`Ваши активные чаты (текущий выделен):`, Markup.inlineKeyboard(buttons));
+      } catch (err) {
+        console.error("Chats Error:", err);
+      }
     });
 
-    bot.action(/mode_(.*)/, (ctx) => {
-      const u = getInitUser(ctx);
-      const newMode = ctx.match[1] as any;
-      u.mode = newMode;
-      saveDB();
-      ctx.answerCbQuery(`Режим: ${newMode}`);
-      ctx.editMessageText(`✅ Режим работы изменен на: <b>${newMode}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+    bot.action(/switchchat_(.*)/, async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const chatId = ctx.match[1];
+        if (u.chats[chatId]) {
+           u.currentChatId = chatId;
+           saveDB();
+           await ctx.answerCbQuery(`Чат переключен на ${u.chats[chatId].name}`).catch(()=>{});
+           await ctx.editMessageText(`✅ Вы переключились на чат: <b>${u.chats[chatId].name}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+        } else {
+           await ctx.answerCbQuery(`Чат не найден`).catch(()=>{});
+        }
+      } catch (err) {
+        console.error("Switch Chat Error:", err);
+      }
     });
 
-    bot.command("model", (ctx) => {
-      const u = getInitUser(ctx);
-      ctx.reply(`Текущая версия модели: <b>${u.modelPreference === 'gemini-3' ? 'Gemini 3 ⭐' : 'Gemini 2'}</b>\nВыберите версию ИИ:`, {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback("Gemini 2", "setmodel_gemini-2"), Markup.button.callback("Gemini 3 ⭐", "setmodel_gemini-3")]
-        ])
-      });
+    bot.command("mode", async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        await ctx.reply(`Текущий режим: <b>${u.mode}</b>\nВыберите новый режим:`, {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("⚡ Быстрый", "mode_fast"), Markup.button.callback("🧠 Мышление", "mode_thinking")],
+            [Markup.button.callback("💻 Код", "mode_code"), Markup.button.callback("🔍 Поиск", "mode_search")]
+          ])
+        });
+      } catch (err) {
+        console.error("Mode Error:", err);
+      }
     });
 
-    bot.action(/setmodel_(.*)/, (ctx) => {
-      const u = getInitUser(ctx);
-      const newModel = ctx.match[1] as any;
-      u.modelPreference = newModel;
-      saveDB();
-      ctx.answerCbQuery(`Модель изменена: ${newModel}`);
-      ctx.editMessageText(`✅ Версия модели изменена на: <b>${newModel === 'gemini-3' ? 'Gemini 3 ⭐' : 'Gemini 2'}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+    bot.action(/mode_(.*)/, async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const newMode = ctx.match[1] as any;
+        u.mode = newMode;
+        saveDB();
+        await ctx.answerCbQuery(`Режим: ${newMode}`).catch(()=>{});
+        await ctx.editMessageText(`✅ Режим работы изменен на: <b>${newMode}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+      } catch (err) {
+        console.error("Mode Action Error:", err);
+      }
+    });
+
+    bot.command("model", async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        await ctx.reply(`Текущая версия модели: <b>${u.modelPreference === 'gemini-3' ? 'Gemini 2 Pro ⭐' : 'Gemini 2 Flash'}</b>\nВыберите версию ИИ:`, {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("Gemini 2 Flash", "setmodel_gemini-2"), Markup.button.callback("Gemini 2 Pro ⭐", "setmodel_gemini-3")]
+          ])
+        });
+      } catch (err) {
+        console.error("Model select Error:", err);
+      }
+    });
+
+    bot.action(/setmodel_(.*)/, async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const newModel = ctx.match[1] as any;
+        u.modelPreference = newModel;
+        saveDB();
+        await ctx.answerCbQuery(`Модель изменена: ${newModel}`).catch(()=>{});
+        await ctx.editMessageText(`✅ Версия модели изменена на: <b>${newModel === 'gemini-3' ? 'Gemini 2 Pro ⭐' : 'Gemini 2 Flash'}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+      } catch (err) {
+        console.error("Model Action Error:", err);
+      }
     });
 
     bot.command("referral", async (ctx) => {
-      const u = getInitUser(ctx);
-      const botUsername = ctx.botInfo?.username || "ТвойБот";
-      const refLink = `https://t.me/${botUsername}?start=${u.id}`;
-      
-      await ctx.reply(
-        `🔗 <b>Твоя реферальная программа</b>\n\n` +
-        `Приглашено друзей: <b>${u.refCount}</b>\n\n` +
-        `Отправь эту ссылку:\n${refLink}\n` + 
-        `<i>Зарабатывай крутые бонусы.</i>`,
-        { parse_mode: "HTML" }
-      ).catch(console.error);
+      try {
+        const u = getInitUser(ctx);
+        const botUsername = ctx.botInfo?.username || "ТвойБот";
+        const refLink = `https://t.me/${botUsername}?start=${u.id}`;
+        
+        await ctx.reply(
+          `🔗 <b>Твоя реферальная программа</b>\n\n` +
+          `Приглашено друзей: <b>${u.refCount}</b>\n\n` +
+          `Отправь эту ссылку:\n${refLink}\n` + 
+          `<i>Зарабатывай крутые бонусы.</i>`,
+          { parse_mode: "HTML" }
+        );
+      } catch (err) {
+         console.error("Referral Error:", err);
+      }
     });
 
-    bot.command("promo", (ctx) => {
-      const u = getInitUser(ctx);
-      const parts = ctx.message.text.split(" ");
-      if (parts.length < 2) return ctx.reply("❌ Введите промокод, например: /promo CODE");
-      
-      const code = parts[1].toUpperCase();
-      if (code === "MAXVERSTAPPENBEST" || code === "KOSTASDEBIL") {
-         if (!u.isSubscribed) {
-           u.isSubscribed = true;
-           saveDB();
-           ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: генерация картинок, Gemini 3, без ограничений по количеству сообщений.");
-         } else {
-           ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
-         }
-      } else {
-         ctx.reply("❌ Промокод отклонён. Проверьте правильность ввода.");
+    bot.command("promo", async (ctx) => {
+      try {
+        const u = getInitUser(ctx);
+        const text = (ctx.message as any)?.text || "";
+        const parts = text.split(/\s+/).filter((p: string) => p.trim() !== "");
+        if (parts.length < 2) return ctx.reply("❌ Введите промокод, например: /promo CODE");
+        
+        const code = parts[1].trim().toUpperCase();
+        if (code === "MAXVERSTAPPENBEST" || code === "KOSTASDEBIL") {
+           if (!u.isSubscribed) {
+             u.isSubscribed = true;
+             saveDB();
+             await ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: генерация картинок, улучшенный ИИ, без ограничений по количеству сообщений.");
+           } else {
+             await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
+           }
+        } else {
+           await ctx.reply(`❌ Промокод «${code}» отклонён. Проверьте правильность ввода.`);
+        }
+      } catch (err) {
+         console.error("Promo Error:", err);
       }
     });
 
@@ -381,11 +418,11 @@ async function startServer() {
         let model = "";
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
-        // Устанавливаем актуальные модели для работы в AI Studio
+        // Строго используем Gemini 2, как просил пользователь!
         if (u.modelPreference === "gemini-3") {
-            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.0-flash";
+            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash"; // PRO версия "Gemini 2"
         } else {
-            model = u.mode === "thinking" ? "gemini-1.5-pro" : "gemini-1.5-flash";
+            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash"; // Базовая версия "Gemini 2"
         }
 
         if (u.mode === "search") {
