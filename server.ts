@@ -356,13 +356,14 @@ async function startServer() {
       if (ctx.chat?.type !== 'private') {
          const botUsername = ctx.botInfo?.username;
          const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
-         const isMentioned = botUsername && text && text.includes(`@${botUsername}`);
+         const isMentioned = botUsername && text && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
          if (!isReplyToBot && !isMentioned) {
              return;
          }
          // Remove the bot username mention from the text so it doesn't confuse the AI
          if (botUsername && text) {
-             text = text.replace(`@${botUsername}`, '').trim();
+             const mentionRegex = new RegExp(`@${botUsername}`, 'ig');
+             text = text.replace(mentionRegex, '').trim();
          }
       }
       const u = getInitUser(ctx);
