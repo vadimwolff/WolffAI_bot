@@ -144,7 +144,6 @@ async function startServer() {
         `Я надёжно изолирую и храню твои чаты, генерирую код, картинки и думаю над сложными задачами!\n\n` +
         `🛠 <b>Команды:</b>\n` +
         `• /mode — Режим работы (⚡Быстрый 🧠Мышление 💻Код 🔍Поиск)\n` +
-        `• /model — Версия (Gemini 2 Flash ↔ Gemini 2 Pro)\n` +
         `• /image [текст] — Создать картинку\n` +
         `• /newchat [название] — Создать новый чат\n` +
         `• /chats — Список твоих чатов\n` +
@@ -239,33 +238,6 @@ async function startServer() {
         await ctx.editMessageText(`✅ Режим работы изменен на: <b>${newMode}</b>`, { parse_mode: "HTML" }).catch(()=>{});
       } catch (err) {
         console.error("Mode Action Error:", err);
-      }
-    });
-
-    bot.command("model", async (ctx) => {
-      try {
-        const u = getInitUser(ctx);
-        await ctx.reply(`Текущая версия модели: <b>${u.modelPreference === 'gemini-3' ? 'Gemini 2 Pro ⭐' : 'Gemini 2 Flash'}</b>\nВыберите версию ИИ:`, {
-          parse_mode: "HTML",
-          ...Markup.inlineKeyboard([
-            [Markup.button.callback("Gemini 2 Flash", "setmodel_gemini-2"), Markup.button.callback("Gemini 2 Pro ⭐", "setmodel_gemini-3")]
-          ])
-        });
-      } catch (err) {
-        console.error("Model select Error:", err);
-      }
-    });
-
-    bot.action(/setmodel_(.*)/, async (ctx) => {
-      try {
-        const u = getInitUser(ctx);
-        const newModel = ctx.match[1] as any;
-        u.modelPreference = newModel;
-        saveDB();
-        await ctx.answerCbQuery(`Модель изменена: ${newModel}`).catch(()=>{});
-        await ctx.editMessageText(`✅ Версия модели изменена на: <b>${newModel === 'gemini-3' ? 'Gemini 2 Pro ⭐' : 'Gemini 2 Flash'}</b>`, { parse_mode: "HTML" }).catch(()=>{});
-      } catch (err) {
-        console.error("Model Action Error:", err);
       }
     });
 
@@ -383,6 +355,7 @@ async function startServer() {
     });
 
     const handleInput = async (ctx: any, text: string) => {
+      if (ctx.chat?.type !== 'private') return;
       const u = getInitUser(ctx);
       
       if (!checkLimit(u)) {
@@ -415,22 +388,16 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "";
+        let model = "gemini-3.5-flash";
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
-        // Строго используем Gemini 2, как просил пользователь!
-        if (u.modelPreference === "gemini-3") {
-            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash"; // PRO версия "Gemini 2"
-        } else {
-            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash"; // Базовая версия "Gemini 2"
-        }
-
-        if (u.mode === "search") {
+        if (u.mode === "thinking") {
+            model = "gemini-3.1-pro-preview"; // Актуальная мыслящая модель для API
+            sysInst += " Глубоко продумывай и аргументируй ответ.";
+        } else if (u.mode === "search") {
            tools = [{ googleSearch: {} }];
-        } else if (u.mode === "thinking") {
-           sysInst = "Ты WolffAi, мощный аналитик. Глубоко продумывай и аргументируй ответ.";
         } else if (u.mode === "code") {
-           sysInst = "Ты WolffAi Senior Кодер. Приводи рабочий код, лучшие практики.";
+           sysInst += " Приводи рабочий код и лучшие практики.";
         }
 
         try {
@@ -455,9 +422,9 @@ async function startServer() {
         } catch (genErr: any) {
            console.error("Gemini Generation Error:", genErr);
            chat.history.pop(); // Revert user query to not corrupt history
-           // Attempt a fallback if the selected model failed (e.g. searching unsupported in gemini-1.5-flash context)
+           // Attempt a fallback if the selected model failed
            if (genErr.message && genErr.message.toLowerCase().includes("not found")) {
-               return ctx.reply(`❌ Выбранная ИИ-модель (${model}) временно недоступна. Попробуйте сменить версию ИИ через /model.`);
+               return ctx.reply(`❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.`);
            }
            ctx.reply("❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.");
         }
