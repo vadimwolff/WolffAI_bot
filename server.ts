@@ -134,7 +134,13 @@ async function startServer() {
         if (!isNaN(inviterId) && users[inviterId] && inviterId !== userId) {
           u.referredBy = inviterId;
           users[inviterId].refCount += 1;
-          ctx.telegram.sendMessage(inviterId, `🎉 По вашей ссылке зарегистрировался: ${ctx.from.first_name}!`).catch(() => {});
+          
+          if (users[inviterId].refCount >= 3 && !users[inviterId].isSubscribed) {
+             users[inviterId].isSubscribed = true;
+             ctx.telegram.sendMessage(inviterId, `🎉 Ура! Вы пригласили 3 друзей и получили БЕЗЛИМИТНЫЙ PRO статус на месяц!`).catch(() => {});
+          } else {
+             ctx.telegram.sendMessage(inviterId, `🎉 По вашей ссылке зарегистрировался: ${ctx.from.first_name}! Приглашено друзей: ${users[inviterId].refCount}/3`).catch(() => {});
+          }
           saveDB();
         }
       }
@@ -144,7 +150,6 @@ async function startServer() {
         `Я надёжно изолирую и храню твои чаты, генерирую код, картинки и думаю над сложными задачами!\n\n` +
         `🛠 <b>Команды:</b>\n` +
         `• /mode — Режим работы (⚡Быстрый 🧠Мышление 💻Код 🔍Поиск)\n` +
-        `• /image [текст] — Создать картинку\n` +
         `• /newchat [название] — Создать новый чат\n` +
         `• /chats — Список твоих чатов\n` +
         `• /clear — Очистить текущий чат\n` + 
@@ -271,7 +276,7 @@ async function startServer() {
            if (!u.isSubscribed) {
              u.isSubscribed = true;
              saveDB();
-             await ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: генерация картинок, улучшенный ИИ, без ограничений по количеству сообщений.");
+             await ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: улучшенный ИИ, без ограничений по количеству сообщений.");
            } else {
              await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
            }
@@ -286,7 +291,7 @@ async function startServer() {
     bot.command("buy", (ctx) => {
       ctx.replyWithInvoice({
         title: "Подписка PRO",
-        description: "Безлимитный доступ, генерация картинок, все режимы.",
+        description: "Безлимитный доступ, все режимы.",
         payload: "sub_1_month",
         provider_token: "",
         currency: "XTR",
@@ -305,39 +310,8 @@ async function startServer() {
       await ctx.reply("🎉 Оплата (Stars) успешна! Твой PRO доступ активирован навсегда!");
     });
 
-    bot.command("image", async (ctx) => {
-      const u = getInitUser(ctx);
-      if (!checkLimit(u)) return ctx.reply("❌ Лимит исчерпан. Повторите попытку завтра или приобретите подписку: /buy");
-      
-      const text = (ctx.message as any)?.text || "";
-      const prompt = text.replace("/image", "").trim();
-      if (!prompt) return ctx.reply("Формат: /image [описание картинки]");
-      
-      if (!ai) return ctx.reply("ИИ отключен.");
-      
-      ctx.sendChatAction("upload_photo").catch(()=>{});
-      try {
-        const response = await ai.models.generateImages({
-            model: 'imagen-3.0-generate-002',
-            prompt: prompt,
-            config: {
-                numberOfImages: 1,
-                aspectRatio: "1:1",
-                outputMimeType: "image/jpeg"
-            }
-        });
-        const base64Image = response.generatedImages?.[0]?.image?.imageBytes;
-        if (base64Image) {
-           await ctx.replyWithPhoto({ source: Buffer.from(base64Image, 'base64') }, {
-              caption: `🖼 Сгенерировано для вас!\n\n💎 Купить PRO: /buy | 🔗 Рефералы: /referral`
-           });
-        } else {
-           ctx.reply("❌ Не удалось сгенерировать изображение. Возможно, описание нарушает политику безопасности.");
-        }
-      } catch (err) {
-        console.error("Image Error:", err);
-        ctx.reply("❌ Ошибка при генерации картинки. Запрос отклонён политикой безопасности.");
-      }
+    bot.command("kostas", async (ctx) => {
+      ctx.reply("671").catch(console.error);
     });
 
     bot.command("broadcast", async (ctx) => {
@@ -412,15 +386,17 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-2.5-flash";
+        let model = "gemini-3.1-flash-lite";
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
         if (u.mode === "thinking") {
-            model = "gemini-2.5-pro";
+            model = "gemma-4-26b";
             sysInst += " Глубоко продумывай и аргументируй ответ.";
         } else if (u.mode === "search") {
+           model = "gemini-3.1-flash-lite";
            tools = [{ googleSearch: {} }];
         } else if (u.mode === "code") {
+           model = "gemma-4-26b";
            sysInst += " Приводи рабочий код и лучшие практики.";
         }
 
@@ -447,10 +423,16 @@ async function startServer() {
            console.error("Gemini Generation Error:", genErr);
            chat.history.pop(); // Revert user query to not corrupt history
            // Attempt a fallback if the selected model failed
-           if (genErr.message && genErr.message.toLowerCase().includes("not found")) {
-               return ctx.reply(`❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.`);
+           let errorDesc = "❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.";
+           if (genErr.message) {
+               const msg = genErr.message.toLowerCase();
+               if (msg.includes("not found")) {
+                   errorDesc = "❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.";
+               } else if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
+                   errorDesc = "❌ Вы исчерпали лимиты запросов у провайдера ИИ (Google API). Попробуйте позже или используйте другой тариф.";
+               }
            }
-           ctx.reply("❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.");
+           ctx.reply(errorDesc);
         }
       } catch (err: any) {
         console.error("General Handler Error:", err);
