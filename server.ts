@@ -535,11 +535,15 @@ async function startServer() {
 
     const webhookDomain = process.env.WEBHOOK_DOMAIN;
     if (webhookDomain) {
-      const webhookPath = `/telegraf/${botToken}`;
-      app.use(bot.webhookCallback(webhookPath));
-      bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`)
-        .then(() => console.log(`Bot started with Webhooks on ${webhookDomain}`))
-        .catch(console.error);
+      try {
+        bot.botInfo = await bot.telegram.getMe();
+        const webhookPath = `/telegraf/${botToken}`;
+        app.use(bot.webhookCallback(webhookPath));
+        await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+        console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
+      } catch (err) {
+        console.error("Failed to initialize webhook:", err);
+      }
     } else {
       bot.launch().then(() => console.log("Bot started with Long Polling")).catch(console.error);
     }
