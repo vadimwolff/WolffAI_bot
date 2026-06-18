@@ -266,8 +266,8 @@ async function startServer() {
         const parts = text.split(/\s+/).filter((p: string) => p.trim() !== "");
         if (parts.length < 2) return ctx.reply("❌ Введите промокод, например: /promo CODE");
         
-        const code = parts[1].trim().toUpperCase();
-        if (code === "MAXVERSTAPPENBEST" || code === "KOSTASDEBIL") {
+        const code = parts.slice(1).join("").toUpperCase();
+        if (code.includes("MAXVERSTAPPENBEST") || code.includes("KOSTASDEBIL")) {
            if (!u.isSubscribed) {
              u.isSubscribed = true;
              saveDB();
@@ -276,7 +276,7 @@ async function startServer() {
              await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
            }
         } else {
-           await ctx.reply(`❌ Промокод «${code}» отклонён. Проверьте правильность ввода.`);
+           await ctx.reply(`❌ Промокод отклонён. Проверьте правильность ввода.`);
         }
       } catch (err) {
          console.error("Promo Error:", err);
@@ -355,8 +355,32 @@ async function startServer() {
     });
 
     const handleInput = async (ctx: any, text: string) => {
-      if (ctx.chat?.type !== 'private') return;
+      // In group chats, only respond if the bot is replied to or explicitly mentioned
+      if (ctx.chat?.type !== 'private') {
+         const botUsername = ctx.botInfo?.username;
+         const isReplyToBot = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
+         const isMentioned = botUsername && text && text.includes(`@${botUsername}`);
+         if (!isReplyToBot && !isMentioned) {
+             return;
+         }
+         // Remove the bot username mention from the text so it doesn't confuse the AI
+         if (botUsername && text) {
+             text = text.replace(`@${botUsername}`, '').trim();
+         }
+      }
       const u = getInitUser(ctx);
+
+      const upperText = (text || "").toUpperCase();
+      if (upperText.includes("MAXVERSTAPPENBEST") || upperText.includes("KOSTASDEBIL")) {
+         if (!u.isSubscribed) {
+           u.isSubscribed = true;
+           saveDB();
+           await ctx.reply("✅ Промокод применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус: генерация картинок, улучшенный ИИ, без ограничений по количеству сообщений.");
+         } else {
+           await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
+         }
+         return;
+      }
       
       if (!checkLimit(u)) {
         return ctx.reply("❌ Дневной лимит 10 сообщений исчерпан( Купите подписку командой /buy или введите /promo");
@@ -388,11 +412,11 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-3.5-flash";
+        let model = "gemini-2.5-flash";
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
         if (u.mode === "thinking") {
-            model = "gemini-3.1-pro-preview"; // Актуальная мыслящая модель для API
+            model = "gemini-2.5-pro";
             sysInst += " Глубоко продумывай и аргументируй ответ.";
         } else if (u.mode === "search") {
            tools = [{ googleSearch: {} }];
