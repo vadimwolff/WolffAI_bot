@@ -165,27 +165,28 @@ async function startServer() {
 
     bot.command("newchat", (ctx) => {
       const u = getInitUser(ctx);
-      const parts = ctx.message.text.split(" ");
-      parts.shift();
+      const text = (ctx.message as any)?.text || "";
+      const parts = text.split(" ");
+      parts.shift(); // remove command
       const name = parts.length > 0 ? parts.join(" ") : `Чат ${Object.keys(u.chats).length + 1}`;
       
       const newId = Date.now().toString();
       u.chats[newId] = { id: newId, name, history: [] };
       u.currentChatId = newId;
       saveDB();
-      ctx.reply(`✅ Создан и выбран новый чат: <b>${name}</b>`, { parse_mode: "HTML" });
+      ctx.reply(`✅ Создан и выбран новый чат: <b>${name}</b>`, { parse_mode: "HTML" }).catch(console.error);
     });
 
     bot.command("chats", (ctx) => {
       const u = getInitUser(ctx);
-      const chatList = Object.values(u.chats);
+      const chatList = Object.values(u.chats).slice(-20); // show up to 20 recent chats
       
       const buttons = chatList.map(c => {
          const prefix = c.id === u.currentChatId ? "👉 " : "";
          return [Markup.button.callback(`${prefix}${c.name}`, `switchchat_${c.id}`)];
       });
       
-      ctx.reply(`Ваши активные чаты (текущий выделен):`, Markup.inlineKeyboard(buttons));
+      ctx.reply(`Ваши активные чаты (текущий выделен):`, Markup.inlineKeyboard(buttons)).catch(console.error);
     });
 
     bot.action(/switchchat_(.*)/, (ctx) => {
@@ -299,12 +300,13 @@ async function startServer() {
       const u = getInitUser(ctx);
       if (!checkLimit(u)) return ctx.reply("❌ Лимит исчерпан. Повторите попытку завтра или приобретите подписку: /buy");
       
-      const prompt = ctx.message.text.replace("/image", "").trim();
+      const text = (ctx.message as any)?.text || "";
+      const prompt = text.replace("/image", "").trim();
       if (!prompt) return ctx.reply("Формат: /image [описание картинки]");
       
       if (!ai) return ctx.reply("ИИ отключен.");
       
-      ctx.sendChatAction("upload_photo");
+      ctx.sendChatAction("upload_photo").catch(()=>{});
       try {
         const response = await ai.models.generateImages({
             model: 'imagen-3.0-generate-002',
@@ -321,7 +323,7 @@ async function startServer() {
               caption: `🖼 Сгенерировано для вас!\n\n💎 Купить PRO: /buy | 🔗 Рефералы: /referral`
            });
         } else {
-           ctx.reply("❌ Не удалось сгенерировать изображение.");
+           ctx.reply("❌ Не удалось сгенерировать изображение. Возможно, описание нарушает политику безопасности.");
         }
       } catch (err) {
         console.error("Image Error:", err);
@@ -351,7 +353,7 @@ async function startServer() {
       }
 
       if (!ai) return ctx.reply("ИИ отключен сервером.");
-      ctx.sendChatAction("typing");
+      ctx.sendChatAction("typing").catch(()=>{});
 
       try {
         let parts: any[] = [];
@@ -379,10 +381,11 @@ async function startServer() {
         let model = "";
         let sysInst = "Ты WolffAi, дерзкий, умный компаньон. Отвечай кратко.";
 
+        // Устанавливаем актуальные модели для работы в AI Studio
         if (u.modelPreference === "gemini-3") {
-            model = u.mode === "thinking" ? "gemini-3.1-pro-preview" : "gemini-3.0-flash";
+            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.0-flash";
         } else {
-            model = u.mode === "thinking" ? "gemini-2.5-pro" : "gemini-2.5-flash";
+            model = u.mode === "thinking" ? "gemini-1.5-pro" : "gemini-1.5-flash";
         }
 
         if (u.mode === "search") {
@@ -393,34 +396,45 @@ async function startServer() {
            sysInst = "Ты WolffAi Senior Кодер. Приводи рабочий код, лучшие практики.";
         }
 
-        const response = await ai.models.generateContent({
-           model,
-           contents: chat.history,
-           config: { 
-             systemInstruction: sysInst,
-             tools: tools
+        try {
+          const response = await ai.models.generateContent({
+             model,
+             contents: chat.history,
+             config: { 
+               systemInstruction: sysInst,
+               tools: tools
+             }
+          });
+
+          const replyText = response.text || "Нет ответа.";
+          
+          chat.history.push({ role: "model", parts: [{ text: replyText }] });
+          saveDB();
+
+          const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
+          await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+            await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
+          });
+        } catch (genErr: any) {
+           console.error("Gemini Generation Error:", genErr);
+           chat.history.pop(); // Revert user query to not corrupt history
+           // Attempt a fallback if the selected model failed (e.g. searching unsupported in gemini-1.5-flash context)
+           if (genErr.message && genErr.message.toLowerCase().includes("not found")) {
+               return ctx.reply(`❌ Выбранная ИИ-модель (${model}) временно недоступна. Попробуйте сменить версию ИИ через /model.`);
            }
-        });
-
-        const replyText = response.text || "Нет ответа.";
-        
-        chat.history.push({ role: "model", parts: [{ text: replyText }] });
-        saveDB();
-
-        const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
-        await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
-          await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
-        });
-
+           ctx.reply("❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.");
+        }
       } catch (err: any) {
-        console.error("Gemini Error:", err);
-        const chat = u.chats[u.currentChatId];
-        chat.history.pop();
-        ctx.reply("❌ Произошла ошибка. Слишком сложный запрос (или переполнение контекста). Попробуйте написать короче или /clear");
+        console.error("General Handler Error:", err);
+        ctx.reply("❌ Произошла системная ошибка. Попробуйте очистить контекст: /clear");
       }
     };
 
-    bot.on(message("text"), (ctx) => handleInput(ctx, ctx.message.text));
+    bot.catch((err, ctx) => {
+       console.error(`Ooops, encountered an error for ${ctx.updateType}`, err);
+    });
+
+    bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
 
     bot.launch().then(() => console.log("Bot started")).catch(console.error);
