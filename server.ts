@@ -5,6 +5,7 @@ import { Telegraf, Markup } from "telegraf";
 import { message } from "telegraf/filters";
 import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from "@google/genai";
 import fs from "fs";
+import { initPlatformBot } from "./platformBot";
 
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "users.json");
@@ -143,8 +144,56 @@ const checkLimit = (user: User, mode: string): boolean => {
   return true;
 }
 
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception thrown:", err);
+});
+
+const withTimeout = <T>(promise: Promise<T>, timeoutMs: number, errorMessage: string = "Timeout"): Promise<T> => {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(errorMessage)), timeoutMs)
+    )
+  ]);
+};
+
+
+const generateWithFallback = async (ai: any, model: string, history: any[], sysInst: string, tools: any): Promise<any> => {
+  const candidates = [model];
+  if (!candidates.includes("gemini-3.5-flash")) candidates.push("gemini-3.5-flash");
+  if (!candidates.includes("gemini-3.1-flash-lite")) candidates.push("gemini-3.1-flash-lite");
+  
+  let lastErr: any = null;
+  for (const cand of candidates) {
+    try {
+      const hasSearchTool = tools && cand.toLowerCase().includes("gemini");
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: cand,
+          contents: history,
+          config: {
+            systemInstruction: sysInst,
+            tools: hasSearchTool ? tools : undefined
+          }
+        }),
+        30000,
+        "Превышено время ожидания ответа от Google Gemini API."
+      );
+      return response;
+    } catch (err: any) {
+      console.error(`Generation failed for model ${cand}:`, err);
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("All models failed");
+};
+
 async function startServer() {
   const app = express();
+  app.use((req, res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); next(); });
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const angryBotToken = process.env.ANGRY_TELEGRAM_BOT_TOKEN;
@@ -154,6 +203,21 @@ async function startServer() {
   let bot: Telegraf | null = null;
   let angryBot: Telegraf | null = null;
   let ai: GoogleGenAI | null = null;
+
+  const isProd = process.env.NODE_ENV === "production";
+  const defaultDomain = isProd
+    ? "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app"
+    : "https://ais-dev-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+  const webhookDomain = process.env.WEBHOOK_DOMAIN;
+
+  const startBotPolling = (b: Telegraf) => {
+    b.telegram.deleteWebhook().then(() => {
+      b.launch().then(() => console.log(`${b.botInfo?.username || "Bot"} started with Long Polling`)).catch(console.error);
+    }).catch((err) => {
+      console.error("Failed to delete webhook:", err);
+      b.launch().then(() => console.log(`${b.botInfo?.username || "Bot"} started with Long Polling (fallback)`)).catch(console.error);
+    });
+  };
 
   if (geminiKey) ai = new GoogleGenAI({ apiKey: geminiKey });
   else console.warn("GEMINI_API_KEY is not set.");
@@ -370,31 +434,7 @@ async function startServer() {
       ctx.reply(`✅ Рассылка: ${s} успешно, ${f} ошибок`);
     });
 
-    const generateWithFallback = async (ai: any, model: string, history: any[], sysInst: string, tools: any) => {
-      const candidates = [model];
-      if (!candidates.includes("gemini-3.5-flash")) candidates.push("gemini-3.5-flash");
-      if (!candidates.includes("gemini-3.1-flash-lite")) candidates.push("gemini-3.1-flash-lite");
-      
-      let lastErr: any = null;
-      for (const cand of candidates) {
-        try {
-          const hasSearchTool = tools && cand.toLowerCase().includes("gemini");
-          const response = await ai.models.generateContent({
-            model: cand,
-            contents: history,
-            config: {
-              systemInstruction: sysInst,
-              tools: hasSearchTool ? tools : undefined
-            }
-          });
-          return response;
-        } catch (err: any) {
-          console.error(`Generation failed for model ${cand}:`, err);
-          lastErr = err;
-        }
-      }
-      throw lastErr || new Error("All models failed");
-    };
+
 
     const handleInput = async (ctx: any, text: string) => {
       // In group chats, only respond if the bot is replied to or explicitly mentioned
@@ -432,7 +472,17 @@ async function startServer() {
       }
 
       if (!ai) return ctx.reply("ИИ отключен сервером.");
-      ctx.sendChatAction("typing").catch(()=>{});
+
+      let statusMsg: any = null;
+      try {
+        statusMsg = await ctx.reply("🧠 WolffAI думает...").catch(() => null);
+      } catch (e) {
+        console.error("Failed to send statusMsg:", e);
+      }
+
+      const typingInterval = setInterval(() => {
+        ctx.sendChatAction("typing").catch(()=>{});
+      }, 4000);
 
       try {
         let parts: any[] = [];
@@ -450,7 +500,69 @@ async function startServer() {
            }
         }
 
-        if (parts.length === 0) return;
+        if (ctx.message.sticker) {
+           const sticker = ctx.message.sticker;
+           try {
+              const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+              const res = await fetch(fileLink.toString());
+              if (res.ok) {
+                const buf = await res.arrayBuffer();
+                parts.push({
+                  inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: "image/webp" }
+                });
+              }
+           } catch (e) {
+              console.error("Error downloading sticker:", e);
+           }
+           if (sticker.emoji) {
+              parts.push({ text: `(Отправлен стикер: ${sticker.emoji})` });
+           } else {
+              parts.push({ text: `(Отправлен стикер)` });
+           }
+        }
+
+        if (ctx.message.animation) {
+           const animation = ctx.message.animation;
+           try {
+              const fileLink = await ctx.telegram.getFileLink(animation.file_id);
+              const res = await fetch(fileLink.toString());
+              if (res.ok) {
+                const buf = await res.arrayBuffer();
+                parts.push({
+                  inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: animation.mime_type || "video/mp4" }
+                });
+              }
+           } catch (e) {
+              console.error("Error downloading animation:", e);
+           }
+        }
+
+        if (ctx.message.document) {
+           const doc = ctx.message.document;
+           const mime = doc.mime_type || "";
+           if (mime.startsWith("image/") || mime.startsWith("video/")) {
+              try {
+                 const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+                 const res = await fetch(fileLink.toString());
+                 if (res.ok) {
+                   const buf = await res.arrayBuffer();
+                   parts.push({
+                     inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: mime }
+                   });
+                 }
+              } catch (e) {
+                 console.error("Error downloading document media:", e);
+              }
+           }
+        }
+
+        if (parts.length === 0) {
+          if (typingInterval) clearInterval(typingInterval);
+          if (statusMsg) {
+            await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+          }
+          return;
+        }
 
         const chat = u.chats[u.currentChatId];
         chat.history.push({ role: "user", parts });
@@ -470,71 +582,58 @@ async function startServer() {
 
         let replyText = "";
         try {
-          const response = await ai.models.generateContent({
-             model,
-             contents: chat.history,
-             config: { 
-               systemInstruction: sysInst,
-               tools: tools
-             }
-          });
+          const response = await generateWithFallback(ai, model, chat.history, sysInst, tools);
           replyText = response.text || "Нет ответа.";
         } catch (genErr: any) {
            console.error("Gemini Generation Error:", genErr);
-           let retrySuccess = false;
-           try {
-             const fallbackRes = await generateWithFallback(ai, model, chat.history, sysInst, tools);
-             replyText = fallbackRes.text || "Нет ответа.";
-             retrySuccess = true;
-           } catch (fallbackErr) {
-             console.error("All fallback models failed:", fallbackErr);
-           }
-           
-           if (!retrySuccess && genErr.message) {
+           chat.history.pop();
+           let errorDesc = `❌ Ошибка генерации для модели ${model}:\n\n${genErr.message || "Неизвестная ошибка"}`;
+           if (genErr.message) {
                const msg = genErr.message.toLowerCase();
                if (msg.includes("limit") || msg.includes("429") || msg.includes("quota") || msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
-                   console.log("Limit / 503 reached. Falling back to gemini-3.1-flash-lite");
-                   try {
-                      const fallbackResponse = await ai.models.generateContent({
-                         model: "gemini-3.1-flash-lite",
-                         contents: chat.history,
-                         config: { systemInstruction: sysInst }
-                      });
-                      replyText = fallbackResponse.text || "Нет ответа.";
-                      retrySuccess = true;
-                   } catch (fallbackErr) {
-                      console.error("Fallback failed:", fallbackErr);
-                   }
+                   errorDesc = "❌ Выбранная модель перегружена (Google API 503). Пожалуйста, повторите запрос чуть позже.";
                }
            }
-
-           if (!retrySuccess) {
-               chat.history.pop(); // Revert user query to not corrupt history
-               let errorDesc = "❌ Произошла ошибка. Слишком сложный запрос, или данная функция не поддерживается в текущем режиме.";
-               if (genErr.message) {
-                   const msg = genErr.message.toLowerCase();
-                   if (msg.includes("not found")) {
-                       errorDesc = "❌ Выбранная ИИ-модель временно недоступна в этом режиме. Попробуйте сменить через /mode.";
-                   } else if (msg.includes("limit") || msg.includes("429") || msg.includes("quota")) {
-                       errorDesc = "❌ Вы исчерпали лимиты запросов у провайдера ИИ (Google API). Попробуйте позже или используйте другой тариф.";
-                   } else if (msg.includes("503") || msg.includes("unavailable") || msg.includes("demand")) {
-                       errorDesc = "❌ Выбранная модель перегружена (Google API 503). Пожалуйста, повторите запрос чуть позже.";
-                   }
-               }
-               return ctx.reply(errorDesc);
+           if (statusMsg) {
+               await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, errorDesc).catch(async () => {
+                   await ctx.reply(errorDesc);
+               });
+           } else {
+               await ctx.reply(errorDesc);
            }
+           return;
         }
 
         chat.history.push({ role: "model", parts: [{ text: replyText }] });
         saveDB();
 
         const footer = `\n\n---\n💎 Подключить PRO: /buy\n🔗 Реферальная программа: /referral`;
-        await ctx.reply(replyText + footer, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
-          await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
-        });
+        const textAndFooter = replyText + footer;
+        if (statusMsg) {
+          await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, textAndFooter, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, replyText + "\n\n--- 💎 /buy | 🔗 /referral").catch(async () => {
+              await ctx.reply(textAndFooter, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+                await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
+              });
+            });
+          });
+        } else {
+          await ctx.reply(textAndFooter, { parse_mode: "HTML", disable_web_page_preview: true }).catch(async () => {
+            await ctx.reply(replyText + "\n\n--- 💎 /buy | 🔗 /referral");
+          });
+        }
       } catch (err: any) {
         console.error("General Handler Error:", err);
-        ctx.reply("❌ Произошла системная ошибка. Попробуйте очистить контекст: /clear");
+        const errMsg = "❌ Произошла системная ошибка. Попробуйте очистить контекст: /clear";
+        if (statusMsg) {
+          await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, errMsg).catch(async () => {
+             await ctx.reply(errMsg);
+          });
+        } else {
+          await ctx.reply(errMsg);
+        }
+      } finally {
+        if (typingInterval) clearInterval(typingInterval);
       }
     };
 
@@ -544,30 +643,22 @@ async function startServer() {
 
     bot.on(message("text"), (ctx) => handleInput(ctx, (ctx.message as any).text));
     bot.on(message("photo"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
-
-    const isProd = process.env.NODE_ENV === "production";
-    if (isProd) {
-      const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
-      if (webhookDomain) {
-        try {
-          bot.botInfo = await bot.telegram.getMe();
-          const webhookPath = `/telegraf/${botToken}`;
-          app.post(webhookPath, bot.webhookCallback());
-          await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-          console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
-        } catch (err) {
-          console.error("Failed to initialize webhook:", err);
-        }
-      } else {
-        bot.launch().then(() => console.log("Bot started with Long Polling (no domain)")).catch(console.error);
+    bot.on(message("sticker"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
+    bot.on(message("animation"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
+    bot.on(message("document"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
+    if (webhookDomain) {
+      try {
+        bot.botInfo = await bot.telegram.getMe();
+        const webhookPath = `/telegraf/${botToken}`;
+        app.use(bot.webhookCallback(webhookPath));
+        await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+        console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
+      } catch (err) {
+        console.error("Failed to initialize webhook, falling back to polling:", err);
+        startBotPolling(bot);
       }
     } else {
-      bot.telegram.deleteWebhook().then(() => {
-        bot!.launch().then(() => console.log("Bot started with Long Polling in Dev mode")).catch(console.error);
-      }).catch((err) => {
-        console.error("Failed to delete webhook for bot:", err);
-        bot!.launch().then(() => console.log("Bot started with Long Polling in Dev mode (fallback)")).catch(console.error);
-      });
+      startBotPolling(bot);
     }
 
     process.once("SIGINT", () => bot?.stop("SIGINT"));
@@ -631,7 +722,17 @@ async function startServer() {
       }
 
       if (!ai) return ctx.reply("ИИ сдох. Повезло тебе.");
-      ctx.sendChatAction("typing").catch(()=>{});
+
+      let statusMsg: any = null;
+      try {
+        statusMsg = await ctx.reply("👿 AngryAI придумывает унижение...").catch(() => null);
+      } catch (e) {
+        console.error("Failed to send statusMsg:", e);
+      }
+
+      const typingInterval = setInterval(() => {
+        ctx.sendChatAction("typing").catch(()=>{});
+      }, 4000);
 
       try {
          let parts: any[] = [];
@@ -649,7 +750,69 @@ async function startServer() {
             }
          }
 
-         if (parts.length === 0) return;
+         if (ctx.message.sticker) {
+            const sticker = ctx.message.sticker;
+            try {
+               const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+               const res = await fetch(fileLink.toString());
+               if (res.ok) {
+                 const buf = await res.arrayBuffer();
+                 parts.push({
+                   inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: "image/webp" }
+                 });
+               }
+            } catch (e) {
+               console.error("Error downloading sticker:", e);
+            }
+            if (sticker.emoji) {
+               parts.push({ text: `(Отправлен стикер: ${sticker.emoji})` });
+            } else {
+               parts.push({ text: `(Отправлен стикер)` });
+            }
+         }
+
+         if (ctx.message.animation) {
+            const animation = ctx.message.animation;
+            try {
+               const fileLink = await ctx.telegram.getFileLink(animation.file_id);
+               const res = await fetch(fileLink.toString());
+               if (res.ok) {
+                 const buf = await res.arrayBuffer();
+                 parts.push({
+                   inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: animation.mime_type || "video/mp4" }
+                 });
+               }
+            } catch (e) {
+               console.error("Error downloading animation:", e);
+            }
+         }
+
+         if (ctx.message.document) {
+            const doc = ctx.message.document;
+            const mime = doc.mime_type || "";
+            if (mime.startsWith("image/") || mime.startsWith("video/")) {
+               try {
+                  const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+                  const res = await fetch(fileLink.toString());
+                  if (res.ok) {
+                    const buf = await res.arrayBuffer();
+                    parts.push({
+                      inlineData: { data: Buffer.from(buf).toString('base64'), mimeType: mime }
+                    });
+                  }
+               } catch (e) {
+                  console.error("Error downloading document media:", e);
+               }
+            }
+         }
+
+         if (parts.length === 0) {
+            if (typingInterval) clearInterval(typingInterval);
+            if (statusMsg) {
+              await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+            }
+            return;
+         }
 
          const chat = getAngryChat(u);
          chat.history.push({ role: "user", parts });
@@ -666,39 +829,20 @@ async function startServer() {
 
          let replyText = "";
          try {
-           const response = await ai.models.generateContent({
-              model: "gemini-3.5-flash",
-               contents: chat.history,
-               config: {
-                 systemInstruction: sysInst,
-                 temperature: 1.35,
-                 safetySettings
-               }
-           });
+           const response = await generateWithFallback(ai, "gemini-3.5-flash", chat.history, sysInst, undefined);
            replyText = response.text || "Даже отвечать тебе не хочу.";
          } catch (genErr: any) {
             console.error("Angry Gemini Generation Error:", genErr);
-            let retrySuccess = false;
-            try {
-              const fallbackResponse = await ai.models.generateContent({
-                 model: "gemini-3.1-flash-lite",
-                 contents: chat.history,
-                 config: { 
-                   systemInstruction: sysInst,
-                   temperature: 1.35,
-                   safetySettings
-                 }
-              });
-              replyText = fallbackResponse.text || "Даже отвечать тебе не хочу.";
-              retrySuccess = true;
-            } catch (fallbackErr) {
-               console.error("Angry Fallback failed:", fallbackErr);
+            chat.history.pop();
+            const errText = "❌ Ошибка генерации. Повезло тебе, твой никчемный мозг спасен от сокрушительного ответа.";
+            if (statusMsg) {
+                await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, errText).catch(async () => {
+                    await ctx.reply(errText);
+                });
+            } else {
+                await ctx.reply(errText);
             }
-
-            if (!retrySuccess) {
-                chat.history.pop();
-                return ctx.reply("❌ Ошибка генерации. Повезло тебе, твой никчемный мозг спасен от сокрушительного ответа.");
-            }
+            return;
          }
 
          chat.history.push({ role: "model", parts: [{ text: replyText }] });
@@ -706,41 +850,57 @@ async function startServer() {
 
          const finalReply = replyText + getSarcasticFooter();
 
-         await ctx.reply(finalReply, { parse_mode: "HTML" }).catch(async () => {
-           await ctx.reply(finalReply);
-         });
+         if (statusMsg) {
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, finalReply, { parse_mode: "HTML" }).catch(async () => {
+              await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, finalReply).catch(async () => {
+                await ctx.reply(finalReply, { parse_mode: "HTML" }).catch(async () => {
+                  await ctx.reply(finalReply);
+                });
+              });
+            });
+         } else {
+            await ctx.reply(finalReply, { parse_mode: "HTML" }).catch(async () => {
+              await ctx.reply(finalReply);
+            });
+         }
       } catch (err: any) {
          console.error("Angry General Handler Error:", err);
-         ctx.reply("❌ Ой, всё сломалось. Давай плачь дальше, пока админ чинит: /clear");
+         const errMsg = "❌ Ой, всё сломалось. Давай плачь дальше, пока админ чинит: /clear";
+         if (statusMsg) {
+            await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, errMsg).catch(async () => {
+              await ctx.reply(errMsg);
+            });
+         } else {
+            ctx.reply(errMsg);
+         }
+      } finally {
+         if (typingInterval) clearInterval(typingInterval);
       }
     };
 
+    angryBot.catch((err, ctx) => {
+       console.error(`Angry Bot encountered an error for ${ctx.updateType}`, err);
+    });
+
     angryBot.on(message("text"), (ctx) => handleAngryInput(ctx, (ctx.message as any).text));
     angryBot.on(message("photo"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
+    angryBot.on(message("sticker"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
+    angryBot.on(message("animation"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
+    angryBot.on(message("document"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
 
-    const isProd = process.env.NODE_ENV === "production";
-    if (isProd) {
-      const webhookDomain = process.env.APP_URL || process.env.WEBHOOK_DOMAIN || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
-      if (webhookDomain) {
-        try {
-          angryBot.botInfo = await angryBot.telegram.getMe();
-          const webhookPath = `/telegraf_angry/${angryBotToken}`;
-          app.post(webhookPath, angryBot.webhookCallback());
-          await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-          console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
-        } catch (err) {
-          console.error("Failed to initialize Angry Bot webhook:", err);
-        }
-      } else {
-        angryBot.launch().then(() => console.log("Angry Bot started with Long Polling (no domain)")).catch(console.error);
+    if (webhookDomain) {
+      try {
+        angryBot.botInfo = await angryBot.telegram.getMe();
+        const webhookPath = `/telegraf_angry/${angryBotToken}`;
+        app.use(angryBot.webhookCallback(webhookPath));
+        await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
+        console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
+      } catch (err) {
+        console.error("Failed to initialize Angry Bot webhook, falling back to polling:", err);
+        startBotPolling(angryBot);
       }
     } else {
-      angryBot.telegram.deleteWebhook().then(() => {
-        angryBot!.launch().then(() => console.log("Angry Bot started with Long Polling in Dev mode")).catch(console.error);
-      }).catch((err) => {
-        console.error("Failed to delete webhook for Angry Bot:", err);
-        angryBot!.launch().then(() => console.log("Angry Bot started with Long Polling in Dev mode (fallback)")).catch(console.error);
-      });
+      startBotPolling(angryBot);
     }
 
     process.once("SIGINT", () => angryBot?.stop("SIGINT"));
@@ -749,15 +909,35 @@ async function startServer() {
     console.log("ANGRY_TELEGRAM_BOT_TOKEN missing");
   }
 
+  // Initialize the new WolffAIPlatform Bot (completely isolated from other bots)
+  try {
+    initPlatformBot(app);
+    console.log("WolffAIPlatform Bot successfully initialized.");
+  } catch (err) {
+    console.error("Failed to initialize WolffAIPlatform Bot:", err);
+  }
+
+  app.use(express.json());
   app.get("/api/health", (req, res) => {
     res.status(200).send("OK");
   });
 
   app.get("/api/stats", (req, res) => {
+    let platformUsersCount = 0;
+    try {
+      const DB_PLATFORM_FILE = path.join(process.cwd(), "platform_users.json");
+      if (fs.existsSync(DB_PLATFORM_FILE)) {
+        const uData = JSON.parse(fs.readFileSync(DB_PLATFORM_FILE, "utf-8"));
+        platformUsersCount = Object.keys(uData).length;
+      }
+    } catch {}
+
     res.json({
       totalUsers: Object.keys(users).length,
+      platformUsers: platformUsersCount,
       botActive: !!botToken,
-      angryBotActive: !!angryBotToken
+      angryBotActive: !!angryBotToken,
+      platformBotActive: !!process.env.PLATFORM_TELEGRAM_BOT_TOKEN
     });
   });
 
