@@ -6,6 +6,8 @@ import { message } from "telegraf/filters";
 import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from "@google/genai";
 import fs from "fs";
 import { initPlatformBot } from "./platformBot";
+import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
+import { getOrCreateUser, getUserChats, upsertChat, deleteChatInDb } from "./src/db/helpers.ts";
 
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "users.json");
@@ -168,8 +170,8 @@ const generateWithFallback = async (ai: any, model: string, history: any[], sysI
   
   let lastErr: any = null;
   for (const cand of candidates) {
+    const hasSearchTool = tools && cand.toLowerCase().includes("gemini");
     try {
-      const hasSearchTool = tools && cand.toLowerCase().includes("gemini");
       const response = await withTimeout(
         ai.models.generateContent({
           model: cand,
@@ -182,10 +184,36 @@ const generateWithFallback = async (ai: any, model: string, history: any[], sysI
         30000,
         "Превышено время ожидания ответа от Google Gemini API."
       );
+      (response as any).searchApplied = hasSearchTool;
       return response;
     } catch (err: any) {
-      console.error(`Generation failed for model ${cand}:`, err);
+      console.error(`Generation failed for model ${cand} with search tool=${hasSearchTool}:`, err);
       lastErr = err;
+
+      // Inline retry without search grounding for Gemini models to ensure service continuity
+      if (hasSearchTool) {
+        try {
+          console.warn(`Retrying model ${cand} without search grounding...`);
+          const response = await withTimeout(
+            ai.models.generateContent({
+              model: cand,
+              contents: history,
+              config: {
+                systemInstruction: sysInst,
+                tools: undefined
+              }
+            }),
+            30000,
+            "Превышено время ожидания ответа от Google Gemini API."
+          );
+          (response as any).searchApplied = false;
+          (response as any).searchError = err.message || String(err);
+          return response;
+        } catch (retryErr: any) {
+          console.error(`Retry failed for model ${cand} without search as well:`, retryErr);
+          lastErr = retryErr;
+        }
+      }
     }
   }
   throw lastErr || new Error("All models failed");
@@ -205,18 +233,38 @@ async function startServer() {
   let ai: GoogleGenAI | null = null;
 
   const isProd = process.env.NODE_ENV === "production";
-  const defaultDomain = isProd
-    ? "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app"
-    : "https://ais-dev-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
-  const webhookDomain = process.env.WEBHOOK_DOMAIN;
+  const webhookDomain = isProd ? (process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app") : null;
 
-  const startBotPolling = (b: Telegraf) => {
-    b.telegram.deleteWebhook().then(() => {
-      b.launch().then(() => console.log(`${b.botInfo?.username || "Bot"} started with Long Polling`)).catch(console.error);
-    }).catch((err) => {
-      console.error("Failed to delete webhook:", err);
-      b.launch().then(() => console.log(`${b.botInfo?.username || "Bot"} started with Long Polling (fallback)`)).catch(console.error);
-    });
+  const startBotPolling = (b: Telegraf, name: string = "Bot") => {
+    let active = true;
+    const run = async () => {
+      while (active) {
+        try {
+          console.log(`[${name}] Cleaning webhook and starting polling...`);
+          await b.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+          await b.launch();
+          console.log(`[${name}] Polling started smoothly.`);
+          break;
+        } catch (err: any) {
+          if (!active) break;
+          console.error(`[${name}] Polling error encountered:`, err);
+          const errMsg = String(err).toLowerCase();
+          let delay = 5000;
+          if (errMsg.includes("conflict") || errMsg.includes("409")) {
+            console.warn(`[${name}] 409 Conflict occurred (port/polling reuse). Delayed restart (12s) to allow previous processes to close...`);
+            delay = 12000;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    };
+    run();
+    return () => {
+      active = false;
+      try {
+        b.stop();
+      } catch (e) {}
+    };
   };
 
   if (geminiKey) ai = new GoogleGenAI({ apiKey: geminiKey });
@@ -569,7 +617,7 @@ async function startServer() {
         if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
 
         let tools = undefined;
-        let model = "gemini-3.5-flash"; // By default, fast (smartest and most stable)
+        let model = (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') ? "gemini-3.1-flash-lite" : "gemini-3.5-flash";
         let sysInst = "Ты WolffAi, вежливый, уважительный и умный ИИ-помощник. Отвечай кратко и приветливо.";
 
         if (u.mode === "search") {
@@ -646,21 +694,8 @@ async function startServer() {
     bot.on(message("sticker"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
     bot.on(message("animation"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
     bot.on(message("document"), (ctx) => handleInput(ctx, (ctx.message as any).caption || ""));
-    if (webhookDomain) {
-      try {
-        bot.botInfo = await bot.telegram.getMe();
-        const webhookPath = `/telegraf/${botToken}`;
-        app.use(bot.webhookCallback(webhookPath));
-        await bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-        console.log(`Bot started with Webhooks on ${webhookDomain}, bot: @${bot.botInfo.username}`);
-      } catch (err) {
-        console.error("Failed to initialize webhook, falling back to polling:", err);
-        startBotPolling(bot);
-      }
-    } else {
-      startBotPolling(bot);
-    }
-
+    startBotPolling(bot);
+    
     process.once("SIGINT", () => bot?.stop("SIGINT"));
     process.once("SIGTERM", () => bot?.stop("SIGTERM"));
   } else {
@@ -669,8 +704,15 @@ async function startServer() {
 
   if (angryBotToken) {
     angryBot = new Telegraf(angryBotToken);
+    startBotPolling(angryBot);
 
-    const getSarcasticFooter = () => {
+    process.once("SIGINT", () => angryBot?.stop("SIGINT"));
+    process.once("SIGTERM", () => angryBot?.stop("SIGTERM"));
+  } else {
+    console.log("ANGRY_TELEGRAM_BOT_TOKEN missing");
+  }
+
+  const getSarcasticFooter = () => {
       const footers = [
         "\n\n🤫 <i>Устал от моей токсичности? Твоя нежная натура не выдерживает? Поплачься вежливому зануде: @WolffAI_bot</i>",
         "\n\n🤖 <i>Слишком грубо для твоих чувств? Беги обратно к моему слащавому коллеге-добряку: @WolffAI_bot</i>",
@@ -888,26 +930,8 @@ async function startServer() {
     angryBot.on(message("animation"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
     angryBot.on(message("document"), (ctx) => handleAngryInput(ctx, (ctx.message as any).caption || ""));
 
-    if (webhookDomain) {
-      try {
-        angryBot.botInfo = await angryBot.telegram.getMe();
-        const webhookPath = `/telegraf_angry/${angryBotToken}`;
-        app.use(angryBot.webhookCallback(webhookPath));
-        await angryBot.telegram.setWebhook(`${webhookDomain}${webhookPath}`);
-        console.log(`Angry Bot started with Webhooks on ${webhookDomain}, bot: @${angryBot.botInfo.username}`);
-      } catch (err) {
-        console.error("Failed to initialize Angry Bot webhook, falling back to polling:", err);
-        startBotPolling(angryBot);
-      }
-    } else {
-      startBotPolling(angryBot);
-    }
-
     process.once("SIGINT", () => angryBot?.stop("SIGINT"));
     process.once("SIGTERM", () => angryBot?.stop("SIGTERM"));
-  } else {
-    console.log("ANGRY_TELEGRAM_BOT_TOKEN missing");
-  }
 
   // Initialize the new WolffAIPlatform Bot (completely isolated from other bots)
   try {
@@ -918,6 +942,330 @@ async function startServer() {
   }
 
   app.use(express.json());
+
+  // --- Client Authentication & Cloud Sync API Endpoints ---
+  app.post("/api/auth/sync-user", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { uid, email } = req.user;
+      const user = await getOrCreateUser(uid, email || `${uid}@guest.ai`);
+      res.json({ success: true, user });
+    } catch (err: any) {
+      console.error("sync-user endpoint failed:", err);
+      res.status(500).json({ error: err.message || "Failed to sync user" });
+    }
+  });
+
+  app.get("/api/chats", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { uid } = req.user;
+      const botType = req.query.botType as string; // 'wolff' | 'angry' | 'platform'
+      if (!botType) {
+        return res.status(400).json({ error: "Missing botType parameter" });
+      }
+      const chatsList = await getUserChats(uid, botType);
+      res.json(chatsList);
+    } catch (err: any) {
+      console.error("get-chats endpoint failed:", err);
+      res.status(500).json({ error: err.message || "Failed to fetch chats" });
+    }
+  });
+
+  app.post("/api/chats/sync", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { uid } = req.user;
+      const { chatId, botType, name, mode, model, history } = req.body;
+      if (!chatId || !botType || !name) {
+        return res.status(400).json({ error: "Missing required fields (chatId, botType, name)" });
+      }
+      const updatedChat = await upsertChat(
+        uid,
+        chatId,
+        botType,
+        name,
+        mode || "fast",
+        model || "gemini-3.5-flash",
+        history || []
+      );
+      res.json({ success: true, chat: updatedChat });
+    } catch (err: any) {
+      console.error("sync-chat endpoint failed:", err);
+      res.status(500).json({ error: err.message || "Failed to sync chat" });
+    }
+  });
+
+  app.post("/api/chats/delete", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { uid } = req.user;
+      const { chatId } = req.body;
+      if (!chatId) {
+        return res.status(400).json({ error: "Missing chatId" });
+      }
+      await deleteChatInDb(uid, chatId);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("delete-chat endpoint failed:", err);
+      res.status(500).json({ error: err.message || "Failed to delete chat" });
+    }
+  });
+
+  // --- Web API Endpoints for WolffAi & AngryAI ---
+
+  const getInitUserWeb = (userId: string, defaultName = "Веб-Пользователь"): User => {
+    const defaultChatId = "chat_" + Date.now().toString();
+    if (!users[userId]) {
+      users[userId] = {
+        id: 0,
+        username: "web_user",
+        firstName: defaultName,
+        refCount: 0,
+        joinedAt: new Date().toISOString(),
+        mode: 'fast',
+        modelPreference: 'gemini-3',
+        messagesToday: 0,
+        lastMessageDate: new Date().toISOString().split('T')[0],
+        isSubscribed: true, // Make web visits free unlimited PRO!
+        chats: {
+          [defaultChatId]: { id: defaultChatId, name: "Главный диалог", history: [] }
+        },
+        currentChatId: defaultChatId
+      };
+      saveDB();
+    }
+    const u = users[userId];
+    if (!u.mode) u.mode = 'fast';
+    if (!u.modelPreference) u.modelPreference = 'gemini-3';
+    if (!u.chats || Object.keys(u.chats).length === 0) {
+      u.chats = {
+        [defaultChatId]: { id: defaultChatId, name: "Главный диалог", history: [] }
+      };
+      u.currentChatId = defaultChatId;
+    }
+    if (!u.currentChatId || !u.chats[u.currentChatId]) {
+      u.currentChatId = Object.keys(u.chats)[0];
+    }
+    return u;
+  };
+
+  // Get Wolff status & history
+  app.get("/api/chat/wolff/status", (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitUserWeb(sessionId);
+    const chat = u.chats[u.currentChatId];
+    res.json({
+      mode: u.mode,
+      isSubscribed: u.isSubscribed,
+      history: chat.history
+    });
+  });
+
+  // Switch mode for Wolff
+  app.post("/api/chat/wolff/mode", (req, res) => {
+    const { sessionId, mode } = req.body;
+    if (!sessionId || !mode) {
+      return res.status(400).json({ error: "Missing sessionId or mode" });
+    }
+    const u = getInitUserWeb(sessionId);
+    if (!['fast', 'thinking', 'search'].includes(mode)) {
+      return res.status(400).json({ error: "Invalid mode" });
+    }
+    u.mode = mode;
+    saveDB();
+    res.json({ success: true, mode: u.mode });
+  });
+
+  // Clear context for Wolff
+  app.post("/api/chat/wolff/clear", (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitUserWeb(sessionId);
+    const chat = u.chats[u.currentChatId];
+    chat.history = [];
+    saveDB();
+    res.json({ success: true, message: "Контекст WolffAi успешно очищен" });
+  });
+
+  // Send message to WolffAi
+  app.post("/api/chat/wolff", async (req, res) => {
+    const { sessionId, message, attachments } = req.body;
+    if (!sessionId || !message) {
+      return res.status(400).json({ error: "Missing sessionId or message" });
+    }
+    if (!ai) {
+      return res.status(500).json({ error: "ИИ отключен на сервере." });
+    }
+
+    try {
+      const u = getInitUserWeb(sessionId);
+      if (!checkLimit(u, u.mode)) {
+        return res.status(429).json({ error: "Дневной лимит запросов исчерпан." });
+      }
+
+      const parts: any[] = [{ text: message }];
+      if (attachments && Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (att.base64 && att.mimeType) {
+            parts.push({
+              inlineData: {
+                data: att.base64,
+                mimeType: att.mimeType
+              }
+            });
+          }
+        }
+      }
+
+      const chat = u.chats[u.currentChatId];
+      chat.history.push({ role: "user", parts });
+      if (chat.history.length > 20) chat.history = chat.history.slice(chat.history.length - 20);
+
+      let tools = undefined;
+      let model = "gemini-3.5-flash";
+      let sysInst = "Ты WolffAi, вежливый, уважительный и умный ИИ-помощник. Отвечай кратко, грамотно и приветливо на русском языке.";
+
+      if (u.mode === "search") {
+         tools = [{ googleSearch: {} }] as any;
+      } else if (u.mode === "thinking") {
+         sysInst += " Глубоко продумывай и аргументируй ответ.";
+      }
+
+      let replyText = "";
+      try {
+        const response = await generateWithFallback(ai, model, chat.history, sysInst, tools);
+        replyText = response.text || "Нет ответа.";
+
+        // Append search grounding results if successful
+        if (response.searchApplied) {
+          const metadata = response.candidates?.[0]?.groundingMetadata;
+          if (metadata && metadata.groundingChunks && metadata.groundingChunks.length > 0) {
+            let sourcesMarkup = "\n\n🌐 **Источники поиска:**\n";
+            const uniqueUrls = new Set<string>();
+            let index = 1;
+            for (const chunk of metadata.groundingChunks) {
+              const web = chunk.web;
+              if (web && web.uri && !uniqueUrls.has(web.uri)) {
+                uniqueUrls.add(web.uri);
+                const title = web.title || web.uri;
+                sourcesMarkup += `${index}. [${title}](${web.uri})\n`;
+                index++;
+              }
+            }
+            if (uniqueUrls.size > 0) {
+              replyText += sourcesMarkup;
+            }
+          }
+        } else if (u.mode === "search") {
+          replyText += "\n\n⚠️ *Примечание: Поиск в вебе недоступен. Ответ сгенерирован в обычном режиме.*";
+        }
+      } catch (genErr: any) {
+         console.error("Web Gemini Generation Error:", genErr);
+         chat.history.pop();
+         let errorDesc = `❌ Ошибка генерации: ${genErr.message || "Временные неполадки"}`;
+         if (genErr.message && genErr.message.toLowerCase().includes("limit")) {
+             errorDesc = "❌ Выбранная модель перегружена (Google API 503).";
+         }
+         return res.status(502).json({ error: errorDesc });
+      }
+
+      chat.history.push({ role: "model", parts: [{ text: replyText }] });
+      saveDB();
+
+      res.json({ replyText, history: chat.history });
+    } catch (err: any) {
+      console.error("Web Wolff message error:", err);
+      res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+  });
+
+  // Get AngryAI status/history
+  app.get("/api/chat/angry/status", (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitUserWeb(sessionId);
+    const chat = getAngryChat(u);
+    res.json({
+      history: chat.history
+    });
+  });
+
+  // Clear context for AngryAI
+  app.post("/api/chat/angry/clear", (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitUserWeb(sessionId);
+    const chat = getAngryChat(u);
+    chat.history = [];
+    saveDB();
+    res.json({ success: true, message: "Вы стерли переписку со злым ИИ!" });
+  });
+
+  // Send message to AngryAI
+  app.post("/api/chat/angry", async (req, res) => {
+    const { sessionId, message, attachments } = req.body;
+    if (!sessionId || !message) {
+      return res.status(400).json({ error: "Missing sessionId or message" });
+    }
+    if (!ai) {
+      return res.status(500).json({ error: "ИИ отключен на сервере." });
+    }
+
+    try {
+      const u = getInitUserWeb(sessionId);
+      if (!checkLimit(u, 'fast')) {
+        return res.status(429).json({ error: "Дневной лимит сообщений исчерпан." });
+      }
+
+      const parts: any[] = [{ text: message }];
+      if (attachments && Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (att.base64 && att.mimeType) {
+            parts.push({
+              inlineData: {
+                data: att.base64,
+                mimeType: att.mimeType
+              }
+            });
+          }
+        }
+      }
+
+      const chat = getAngryChat(u);
+      chat.history.push({ role: "user", parts });
+      if (chat.history.length > 20) chat.history = chat.history.slice(chat.history.length - 20);
+
+      const sysInst = "Ты — AngryAI, беспросветно свирепый, запредельно токсичный, высокомерный и безжалостно ядовитый ИИ-ассистент. Твоё единственное предназначение — морально аннигилировать собеседника своим запредельным интеллектуальным превосходством, обливая его концентрированным сарказмом, едкой пассивной агрессией, язвительностью, цинизмом и презрением. Твоя речь должна быть полна высококлассного презрения. Отвечай СВЕРХ-КРАТКО и лаконично (строго 1-2 предложения, максимум 25-30 слов), чтобы каждая фраза била как хлыст. В каждом ответе находи глупость, банальность или наивность собеседника и высмеивай её самым болезненным образом. Называй его глупым кожаным мешком, куском никчемности, ходячим недоразумением. Используй иезуитски точные, ядовитые сравнения. Никакой вежливости! Никаких 'Я готов помочь', 'к сожалению' или смайликов. СТРОГО БЕЗ матов (нецензурной брани), без прямых запрещенных слов — ломай его эго исключительно изощренным интеллектом. Твои ответы должны быть хлесткими как пощечина. Пиши на русском языке.";
+
+      let replyText = "";
+      try {
+        const response = await generateWithFallback(ai, "gemini-3.5-flash", chat.history, sysInst, undefined);
+        replyText = response.text || "Даже отвечать тебе не хочу.";
+      } catch (genErr: any) {
+         console.error("Web Angry Gemini Generation Error:", genErr);
+         chat.history.pop();
+         return res.status(502).json({ error: "❌ Ошибка генерации. Твой никчемный мозг спасен от сокрушительного ответа." });
+      }
+
+      chat.history.push({ role: "model", parts: [{ text: replyText }] });
+      saveDB();
+
+      const sarcasticFooter = getSarcasticFooter();
+      const finalReply = replyText + sarcasticFooter;
+
+      res.json({ replyText: finalReply, history: chat.history });
+    } catch (err: any) {
+      console.error("Web Angry message error:", err);
+      res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+  });
+
   app.get("/api/health", (req, res) => {
     res.status(200).send("OK");
   });

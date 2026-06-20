@@ -443,7 +443,7 @@ const handlePlatformInput = async (ctx: any, text: string) => {
       };
 
       let replyText = "";
-      let activeModelAttempt = u.activeModel;
+      let activeModelAttempt = (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') ? "gemini-3.1-flash-lite" : u.activeModel;
       let usedFallback = false;
       let fallbackErrorMsg = "";
 
@@ -520,7 +520,246 @@ const handlePlatformInput = async (ctx: any, text: string) => {
 };
 
 export function initPlatformBot(app: express.Express) {
-  const webhookDomain = process.env.WEBHOOK_DOMAIN;
+  // --- Web API Endpoints for PlatformBot ---
+  
+  // 1. Get Models List
+  app.get("/api/chat/platform/models", (req, res) => {
+    res.json(MODELS_INFO);
+  });
+
+  // Helper to init web user
+  const getInitPlatformUserWeb = (userId: string): PlatformUser => {
+    const defaultChatId = "chat_" + Date.now().toString();
+    if (!platformUsers[userId]) {
+      platformUsers[userId] = {
+        id: 0,
+        username: "web_user",
+        firstName: "Веб-Пользователь",
+        joinedAt: new Date().toISOString(),
+        activeModel: "gemini-3.1-flash-lite",
+        chats: {
+          [defaultChatId]: { id: defaultChatId, name: "Главный диалог", history: [] }
+        },
+        currentChatId: defaultChatId,
+        messagesToday: 0,
+        lastMessageDate: new Date().toISOString().split('T')[0],
+        isSubscribed: true // Web users get PREMIUM directly for awesome testing
+      };
+      savePlatformDB();
+    }
+    const u = platformUsers[userId];
+    const modelExists = MODELS_INFO.some(m => m.id === u.activeModel);
+    if (!modelExists) {
+      u.activeModel = "gemini-3.1-flash-lite";
+      savePlatformDB();
+    }
+    return u;
+  };
+
+  // 2. Clear Context
+  app.post("/api/chat/platform/clear", (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitPlatformUserWeb(sessionId);
+    const chat = getActiveChat(u);
+    chat.history = [];
+    savePlatformDB();
+    res.json({ success: true, message: "Контекст WolffAIPlatform очищен!" });
+  });
+
+  // 3. Set Active Model
+  app.post("/api/chat/platform/set-model", (req, res) => {
+    const { sessionId, modelId } = req.body;
+    if (!sessionId || !modelId) {
+      return res.status(400).json({ error: "Missing sessionId or modelId" });
+    }
+    const u = getInitPlatformUserWeb(sessionId);
+    const modelExists = MODELS_INFO.some(m => m.id === modelId);
+    if (!modelExists) {
+      return res.status(404).json({ error: "Model not found" });
+    }
+    u.activeModel = modelId;
+    savePlatformDB();
+    res.json({ success: true, activeModel: u.activeModel, modelFriendlyName: getModelFriendlyName(u.activeModel) });
+  });
+
+  // 4. Get Status
+  app.get("/api/chat/platform/status", (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId" });
+    }
+    const u = getInitPlatformUserWeb(sessionId);
+    const chat = getActiveChat(u);
+    const today = new Date().toISOString().split('T')[0];
+    if (u.lastMessageDate !== today) {
+       u.messagesToday = 0;
+       u.modelMessagesToday = {};
+       u.lastMessageDate = today;
+       savePlatformDB();
+    }
+    const limitCheck = checkPlatformLimit(u, u.activeModel);
+    res.json({
+      activeModel: u.activeModel,
+      activeModelFriendlyName: getModelFriendlyName(u.activeModel),
+      isSubscribed: u.isSubscribed,
+      messagesToday: u.messagesToday,
+      limitCheck,
+      history: chat.history
+    });
+  });
+
+  // 5. Send Web Message to PlatformBot
+  app.post("/api/chat/platform/message", async (req, res) => {
+    const { sessionId, message, attachments } = req.body;
+    if (!sessionId || !message) {
+      return res.status(400).json({ error: "Missing sessionId or message" });
+    }
+
+    const openrouterKey = process.env.OPENROUTER_API_KEY;
+    const u = getInitPlatformUserWeb(sessionId);
+    
+    // Auto fallback to Gemini 3.5 Flash if OpenRouter key is missing and selected model is non-Gemini.
+    let currentModel = u.activeModel;
+    let fallbackDueToNoKey = false;
+    if (!currentModel.startsWith("gemini-") && !openrouterKey) {
+      currentModel = "gemini-3.5-flash";
+      fallbackDueToNoKey = true;
+    }
+
+    try {
+      const limitCheck = checkPlatformLimit(u, currentModel);
+      if (!limitCheck.allowed) {
+        return res.status(429).json({ error: `Дневной лимит для модели ${getModelFriendlyName(currentModel)} исчерпан.` });
+      }
+
+      // Track usage
+      if (!u.modelMessagesToday) u.modelMessagesToday = {};
+      u.modelMessagesToday[currentModel] = (u.modelMessagesToday[currentModel] || 0) + 1;
+      u.messagesToday += 1;
+      savePlatformDB();
+
+      const chat = getActiveChat(u);
+      
+      let userRepresentation: any = message;
+      if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+        const contentArr: any[] = [{ type: 'text', text: message }];
+        for (const att of attachments) {
+          if (att.base64 && att.mimeType) {
+            contentArr.push({
+              type: 'image_url',
+              image_url: {
+                url: `data:${att.mimeType};base64,${att.base64}`
+              }
+            });
+          }
+        }
+        userRepresentation = contentArr;
+      }
+
+      chat.history.push({ role: "user", content: userRepresentation });
+      if (chat.history.length > 24) {
+        chat.history = chat.history.slice(chat.history.length - 24);
+      }
+
+      const generateModelContentWeb = async (modelId: string, history: any[]): Promise<string> => {
+        if (modelId.startsWith("gemini-")) {
+          if (!aiClient) {
+            throw new Error("Google Gemini API не инициализирован.");
+          }
+          const contents = historyToGeminiContents(history);
+          const geminiResponse = await withTimeout(
+            aiClient.models.generateContent({
+              model: modelId,
+              contents: contents,
+            }),
+            25000,
+            "Google Gemini API ответил тайм-аутом."
+          );
+          return geminiResponse.text || "";
+        } else {
+          if (!openrouterKey) {
+            throw new Error("OPENROUTER_API_KEY не задан.");
+          }
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 25000);
+          try {
+            const apiRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${openrouterKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": process.env.APP_URL || "https://ais-dev.europe-west1.run.app",
+                "X-Title": "WolffAIPlatform"
+              },
+              body: JSON.stringify({
+                model: modelId,
+                messages: history
+              }),
+              signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (!apiRes.ok) {
+              const errText = await apiRes.text();
+              throw new Error(`OpenRouter HTTP ${apiRes.status}: ${errText}`);
+            }
+            const apiData: any = await apiRes.json();
+            return apiData.choices?.[0]?.message?.content || "";
+          } catch (e) {
+            clearTimeout(timeoutId);
+            throw e;
+          }
+        }
+      };
+
+      let replyText = "";
+      let activeModelAttempt = currentModel;
+      let usedFallback = false;
+      let fallbackErrorMsg = "";
+
+      try {
+        replyText = await generateModelContentWeb(activeModelAttempt, chat.history);
+      } catch (err: any) {
+        console.error(`Web PlatformBot attempt failed with ${activeModelAttempt}:`, err);
+        fallbackErrorMsg = err.message || String(err);
+        
+        const fallbacks = ["gemini-3.5-flash", "gemini-3.1-flash-lite"].filter(m => m !== currentModel);
+        for (const candidate of fallbacks) {
+          try {
+            replyText = await generateModelContentWeb(candidate, chat.history);
+            activeModelAttempt = candidate;
+            usedFallback = true;
+            break;
+          } catch (fErr) {
+            console.error(`Fallback failed: ${candidate}`, fErr);
+          }
+        }
+
+        if (!replyText) {
+          chat.history.pop();
+          savePlatformDB();
+          return res.status(502).json({ error: `Все модели ИИ временно недоступны. Ошибка: ${fallbackErrorMsg}` });
+        }
+      }
+
+      if (usedFallback || fallbackDueToNoKey) {
+        replyText += `\n\n⚠️ *Примечание: Модель [${getModelFriendlyName(u.activeModel)}] требует настройки OpenRouter на сервере или временно недоступна. Автоматически применена модель [${getModelFriendlyName(activeModelAttempt)}].*`;
+      }
+
+      chat.history.push({ role: "assistant", content: replyText });
+      savePlatformDB();
+
+      res.json({ replyText, history: chat.history });
+    } catch (err: any) {
+      console.error("Web platform-message error:", err);
+      res.status(500).json({ error: err.message || "Internal server error" });
+    }
+  });
+
+  const isProd = process.env.NODE_ENV === "production";
+  const webhookDomain = isProd ? (process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app") : null;
   const token = process.env.PLATFORM_TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.log("PLATFORM_TELEGRAM_BOT_TOKEN missing in env.");
@@ -751,34 +990,45 @@ export function initPlatformBot(app: express.Express) {
   });
 
   const startBotPolling = (b: Telegraf) => {
-    b.telegram.deleteWebhook().then(() => {
-      b.launch().then(() => console.log(`${b.botInfo?.username || "Platform Bot"} started with Long Polling`)).catch(console.error);
-    }).catch((err) => {
-      console.error("Failed to delete webhook for Platform Bot:", err);
-      b.launch().then(() => console.log(`${b.botInfo?.username || "Platform Bot"} started with Long Polling (fallback)`)).catch(console.error);
-    });
+    let active = true;
+    const run = async () => {
+      while (active) {
+        try {
+          console.log(`[Platform Bot] Cleaning webhook and preparing to start polling...`);
+          await b.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+          await b.launch();
+          console.log(`[Platform Bot] Polling started cleanly.`);
+          break; // If launch returns naturally, exit the loop
+        } catch (err: any) {
+          if (!active) break;
+          console.error(`[Platform Bot] Polling error encountered:`, err);
+          const errMsg = String(err).toLowerCase();
+          let delay = 5000;
+          if (errMsg.includes("conflict") || errMsg.includes("409")) {
+            console.warn(`[Platform Bot] 409 Conflict detected. Older dev processes might be closing. Retrying in 12s...`);
+            delay = 12000;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    };
+    run();
+    return () => {
+      active = false;
+      try {
+        b.stop();
+      } catch (e) {}
+    };
   };
 
-  if (webhookDomain) {
-    try {
-      bot.botInfo = { id: 0, is_bot: true, first_name: "WolffAIPlatform Bot", username: "WolffAIPlatform_bot", can_join_groups: true, can_read_all_group_messages: true, supports_inline_queries: false };
-      bot.telegram.getMe().then(info => { bot.botInfo = info; }).catch(()=>{});
-      const webhookPath = `/telegraf_platform/${token}`;
-      app.use(bot.webhookCallback(webhookPath));
-      bot.telegram.setWebhook(`${webhookDomain}${webhookPath}`)
-        .then(() => console.log(`Platform Bot started with Webhooks on ${webhookDomain}`))
-        .catch(err => {
-          console.error("Failed to initialize Platform Bot webhook, falling back to polling:", err);
-          startBotPolling(bot);
-        });
-    } catch (err) {
-      console.error("Platform Bot callback setup error, falling back to polling:", err);
-      startBotPolling(bot);
-    }
-  } else {
-    startBotPolling(bot);
-  }
+  const stopBot = startBotPolling(bot);
 
-  process.once("SIGINT", () => bot.stop("SIGINT"));
-  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  process.once("SIGINT", () => {
+    stopBot();
+    bot.stop("SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    stopBot();
+    bot.stop("SIGTERM");
+  });
 }
