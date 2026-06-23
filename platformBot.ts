@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
+import { activatePromo } from "./src/lib/promoService";
 
 const withTimeout = <T>(promise: Promise<T>, timeoutMs: number, errorMessage: string = "Timeout"): Promise<T> => {
   return Promise.race([
@@ -25,7 +26,9 @@ const aiClient = geminiApiKey ? new GoogleGenAI({
 }) : null;
 
 function historyToGeminiContents(history: Array<{ role: 'user' | 'assistant'; content: any }>) {
-  return history.map(turn => {
+  const alternating: Array<{ role: 'user' | 'model'; parts: any[] }> = [];
+
+  for (const turn of history) {
     const role = turn.role === 'assistant' ? 'model' : 'user';
     let parts: any[] = [];
     
@@ -53,9 +56,15 @@ function historyToGeminiContents(history: Array<{ role: 'user' | 'assistant'; co
     } else {
       parts.push({ text: String(turn.content || "") });
     }
-    
-    return { role, parts };
-  });
+
+    if (alternating.length > 0 && alternating[alternating.length - 1].role === role) {
+      alternating[alternating.length - 1].parts.push(...parts);
+    } else {
+      alternating.push({ role, parts });
+    }
+  }
+
+  return alternating;
 }
 
 interface PlatformChatSession {
@@ -76,11 +85,23 @@ interface PlatformUser {
   lastMessageDate: string;
   isSubscribed: boolean;
   modelMessagesToday?: Record<string, number>;
+  promoUsed?: string;
+  proRevoked?: boolean;
 }
 
 const DB_PLATFORM_FILE = path.join(process.cwd(), "platform_users.json");
 
-let platformUsers: Record<string, PlatformUser> = {};
+export let platformUsers: Record<string, PlatformUser> = {};
+
+export const groupPlatformChats: Record<string, { id: string; history: any[] }> = {};
+
+export const getGroupPlatformChat = (groupId: string | number) => {
+  const key = String(groupId);
+  if (!groupPlatformChats[key]) {
+    groupPlatformChats[key] = { id: key, history: [] };
+  }
+  return groupPlatformChats[key];
+};
 
 if (fs.existsSync(DB_PLATFORM_FILE)) {
   try {
@@ -91,7 +112,7 @@ if (fs.existsSync(DB_PLATFORM_FILE)) {
   }
 }
 
-const savePlatformDB = () => {
+export const savePlatformDB = () => {
   try {
     fs.writeFileSync(DB_PLATFORM_FILE, JSON.stringify(platformUsers, null, 2));
   } catch (err) {
@@ -99,23 +120,237 @@ const savePlatformDB = () => {
   }
 };
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function sendRobustReply(ctx: any, text: string, statusMsg?: any) {
+  const CHUNK_SIZE = 4000;
+  if (!text) return;
+
+  const chunks: string[] = [];
+  if (text.length <= CHUNK_SIZE) {
+    chunks.push(text);
+  } else {
+    let current = "";
+    const lines = text.split("\n");
+    for (const line of lines) {
+      if (current.length + line.length + 1 > CHUNK_SIZE) {
+        if (current) {
+          chunks.push(current);
+          current = "";
+        }
+        if (line.length > CHUNK_SIZE) {
+          for (let i = 0; i < line.length; i += CHUNK_SIZE) {
+            chunks.push(line.slice(i, i + CHUNK_SIZE));
+          }
+        } else {
+          current = line;
+        }
+      } else {
+        current = current ? (current + "\n" + line) : line;
+      }
+    }
+    if (current) {
+      chunks.push(current);
+    }
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (i === 0 && statusMsg) {
+      const success = await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, chunk, { parse_mode: "Markdown" })
+        .then(() => true)
+        .catch(async () => {
+          return await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, chunk)
+            .then(() => true)
+            .catch(() => false);
+        });
+      
+      if (!success) {
+        await ctx.reply(chunk, { parse_mode: "Markdown" }).catch(async () => {
+          await ctx.reply(chunk).catch(console.error);
+        });
+      }
+    } else {
+      await ctx.reply(chunk, { parse_mode: "Markdown" }).catch(async () => {
+        await ctx.reply(chunk).catch(console.error);
+      });
+    }
+  }
+}
+
+async function generateContentWithRetryAndFallback(modelId: string, history: any[]): Promise<{ text: string; actualModelUsed: string; usedFallback: boolean }> {
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  const openmodelKey = process.env.OPENMODEL_API_KEY || "om-2EYR7FAxLYTj197dyvQU6hoGcixLfEP7zsegu3TctHt";
+  const puterToken = process.env.PUTER_AUTH_TOKEN;
+
+  const tryGenerateOnce = async (mId: string): Promise<string> => {
+    try {
+      if (mId === "deepseek-v4-flash") {
+        // Try OpenModel first
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 12000);
+        try {
+          const response = await fetch("https://api.openmodels.run/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${openmodelKey}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model: "deepseek-v4-flash",
+              messages: history
+            }),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          if (response.ok) {
+            const apiData: any = await response.json();
+            const txt = apiData.choices?.[0]?.message?.content || "";
+            if (txt) return txt;
+          }
+        } catch (err) {
+          clearTimeout(timeoutId);
+          console.warn("[OpenModels] deepseek-v4-flash attempt failed:", err);
+        }
+
+        // If OpenModels failed, try OpenRouter using appropriate IDs
+        if (openrouterKey) {
+          const controller2 = new AbortController();
+          const timeoutId2 = setTimeout(() => controller2.abort(), 12000);
+          try {
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${openrouterKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": process.env.APP_URL || "https://ais-dev.europe-west1.run.app",
+                "X-Title": "WolffAIPlatform"
+              },
+              body: JSON.stringify({
+                model: "deepseek/deepseek-v4-flash",
+                messages: history
+              }),
+              signal: controller2.signal
+            });
+            clearTimeout(timeoutId2);
+            if (response.ok) {
+              const apiData: any = await response.json();
+              const txt = apiData.choices?.[0]?.message?.content || "";
+              if (txt) return txt;
+            }
+          } catch (orErr: any) {
+            clearTimeout(timeoutId2);
+            console.warn("[OpenRouter] deepseek-v4-flash attempt failed:", orErr.message || orErr);
+          }
+        }
+
+        throw new Error("Both attempts failed.");
+      } else if (mId.startsWith("gemini-") && !mId.includes("/")) {
+        if (!aiClient) {
+          throw new Error("Google Gemini API client is not initialized.");
+        }
+        const contents = historyToGeminiContents(history);
+        let realModel = mId;
+        if (mId === "gemini-3.5-flash") {
+          realModel = "gemini-2.5-flash";
+        } else if (mId === "gemini-3.1-pro-preview") {
+          realModel = "gemini-2.5-flash"; // Fallback because 3.1-pro-preview usually rate-limited on free tier
+        }
+        const geminiResponse = await withTimeout(
+          aiClient.models.generateContent({
+            model: realModel,
+            contents: contents,
+          }),
+          90000,
+          "Google Gemini API timeout."
+        );
+        const txt = geminiResponse.text || "";
+        if (!txt) {
+           throw new Error("Empty response from Google Gemini API.");
+        }
+        return txt;
+      } else {
+        // OpenRouter models
+        if (openrouterKey) {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 12000);
+          try {
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${openrouterKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": process.env.APP_URL || "https://ais-dev.europe-west1.run.app",
+                "X-Title": "WolffAIPlatform"
+              },
+              body: JSON.stringify({
+                model: mId,
+                messages: history
+              }),
+              signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (response.ok) {
+              const apiData: any = await response.json();
+              const txt = apiData.choices?.[0]?.message?.content || "";
+              if (txt) return txt;
+            }
+          } catch (e) {
+            clearTimeout(timeoutId);
+            console.warn(`[OpenRouter] ${mId} failed:`, e);
+          }
+        }
+
+        throw new Error("Model query failed.");
+      }
+    } catch (outerErr: any) {
+      console.warn("Outer tryGenerateOnce error:", outerErr);
+      throw outerErr;
+    }
+  };
+
+  const maxRetries = 2;
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[UnifiedGen] Attempt ${attempt} for model: ${modelId}`);
+      const text = await tryGenerateOnce(modelId);
+      return { text, actualModelUsed: modelId, usedFallback: false };
+    } catch (err: any) {
+      console.warn(`[UnifiedGen] Attempt ${attempt} failed for model ${modelId}:`, err.message || err);
+      lastError = err;
+      if (attempt < maxRetries) {
+        await sleep(1000);
+      }
+    }
+  }
+
+  // Fallback to gemini-2.5-flash if everything else failed, and if the current model wasn't gemini-2.5-flash
+  if (modelId !== "gemini-2.5-flash" && aiClient) {
+     try {
+       console.log(`[UnifiedGen] Falling back to gemini-2.5-flash after failure of ${modelId}`);
+       const text = await tryGenerateOnce("gemini-2.5-flash");
+       return { text, actualModelUsed: "gemini-2.5-flash", usedFallback: true };
+     } catch (fallbackErr: any) {
+       console.error(`[UnifiedGen] Fallback also failed:`, fallbackErr);
+     }
+  }
+
+  throw new Error(`Простите, все попытки получить ответ не удались. Ошибка: ${lastError?.message || lastError}`);
+}
+
 const MODELS_INFO = [
-  { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", desc: "Ультрабыстрый мультимодальный флагман через Google Gemini API.", multimodal: true },
-  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B (free)", desc: "Открытая мультимодальная модель от Google DeepMind.", multimodal: true },
-  { id: "meta-llama/llama-3.3-70b-instruct:free", name: "Llama 3.3 70B (free)", desc: "Флагманская модель Meta.", multimodal: false },
-  { id: "nousresearch/hermes-3-llama-3.1-405b:free", name: "Hermes 3 405B", desc: "Огромная модель 405B от Nous Research для сложных рассуждений.", multimodal: false },
-  { id: "openrouter/owl-alpha", name: "Owl Alpha (free)", desc: "Высокопроизводительная модель OpenRouter для агентов.", multimodal: false },
-  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", name: "Nemotron 3 Ultra", desc: "Флагман NVIDIA (550B MoE).", multimodal: false },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 Omni", desc: "Мультимодальная модель от NVIDIA.", multimodal: true },
-  { id: "nvidia/nemotron-3-super-120b-a12b:free", name: "Nemotron 3 Super", desc: "Модель NVIDIA (120B).", multimodal: false },
-  { id: "nex-agi/nex-n2-pro:free", name: "Nex-N2-Pro", desc: "Агентная MoE модель Nex AGI.", multimodal: false },
-  { id: "openai/gpt-oss-120b:free", name: "gpt-oss-120b (free)", desc: "Открытая MoE модель на 120B параметров.", multimodal: false },
-  { id: "openai/gpt-oss-20b:free", name: "gpt-oss-20b (free)", desc: "Открытая модель на 20B параметров от OpenAI.", multimodal: false },
-  { id: "poolside/laguna-m.1:free", name: "Laguna M.1", desc: "Кодинговый агент от Poolside.", multimodal: false },
-  { id: "poolside/laguna-xs.2:free", name: "Laguna XS.2", desc: "Второе поколение кодинговой модели от Poolside.", multimodal: false },
-  { id: "qwen/qwen3-coder:free", name: "Qwen3 Coder", desc: "Моделирование кода Qwen (480B).", multimodal: false },
-  { id: "liquid/lfm-2.5-1.2b-thinking:free", name: "LFM2.5 Thinking", desc: "Легкая модель для рассуждений от Liquid.", multimodal: false },
-  { id: "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", name: "Uncensored Dolphin", desc: "Без цензуры (Dolphin Mistral 24B).", multimodal: false }
+  { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", desc: "Ультрабыстрый мультимодальный флагман Google.", multimodal: true },
+  { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", desc: "Сверхмощная экспериментальная модель Google.", multimodal: true },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", desc: "Надежная быстрая мультимодальная модель.", multimodal: true },
+  { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", desc: "Супер-быстрая и легкая версия Gemini. (Резервная)", multimodal: true },
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (OpenModel)", desc: "Быстрая и эффективная модель следующего поколения от OpenModel.", multimodal: false },
+  { id: "meta-llama/llama-3.3-70b-instruct:free", name: "Llama 3.3 70B", desc: "Мощная открытая модель от Meta.", multimodal: false },
+  { id: "nousresearch/hermes-3-llama-3.1-405b:free", name: "Hermes 3 405B", desc: "Сверхмощная открытая модель от NousResearch.", multimodal: false },
+  { id: "qwen/qwen3-coder:free", name: "Qwen 3 Coder", desc: "Продвинутая модель для написания кода.", multimodal: false },
+  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", desc: "Открытая текстовая модель от Google (OpenRouter).", multimodal: false },
+  { id: "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", name: "Dolphin Mistral 24B", desc: "Модель без цензуры (Venice Edition).", multimodal: false },
+  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 30B", desc: "Reasoning модель от Nvidia.", multimodal: false }
 ];
 
 const getInitPlatformUser = (ctx: any): PlatformUser => {
@@ -128,7 +363,7 @@ const getInitPlatformUser = (ctx: any): PlatformUser => {
       username: ctx.from.username,
       firstName: ctx.from.first_name,
       joinedAt: new Date().toISOString(),
-      activeModel: "gemini-3.1-flash-lite", // Default to lightweight
+      activeModel: "gemini-3.1-pro-preview", // Default to the smartest model
       chats: {
         [defaultChatId]: { id: defaultChatId, name: "Главный диалог", history: [] }
       },
@@ -140,10 +375,60 @@ const getInitPlatformUser = (ctx: any): PlatformUser => {
     savePlatformDB();
   }
   
+  
   const u = platformUsers[userId];
+
+  // Active Promo-duration subscription expiration checks
+  if (u.isSubscribed && (u as any).premiumUntil) {
+    if (new Date() > new Date((u as any).premiumUntil)) {
+      u.isSubscribed = false;
+      (u as any).premiumUntil = undefined;
+      savePlatformDB();
+
+      // Mirror expiration dynamically in users.json if applicable
+      try {
+        const uFile = 'users.json';
+        if (fs.existsSync(uFile)) {
+          const uData = JSON.parse(fs.readFileSync(uFile, "utf-8"));
+          if (uData[userId]) {
+            uData[userId].isSubscribed = false;
+            uData[userId].premiumUntil = undefined;
+            fs.writeFileSync(uFile, JSON.stringify(uData, null, 2), "utf-8");
+          }
+        }
+      } catch (err) {
+        console.error("Failed to propagate subscription expiration to main database from platform:", err);
+      }
+    }
+  }
+  
+  // Sync PRO status from main users.json
+  try {
+    const mainUsersStr = fs.readFileSync('users.json', 'utf8');
+    const mainUsers = JSON.parse(mainUsersStr);
+    if (mainUsers[userId]) {
+      if (mainUsers[userId].isSubscribed || mainUsers[userId].role === 'admin') {
+        if (!u.isSubscribed) {
+          u.isSubscribed = true;
+          if (mainUsers[userId].premiumUntil) {
+            (u as any).premiumUntil = mainUsers[userId].premiumUntil;
+          }
+          savePlatformDB();
+        }
+      } else {
+        // If expired or suspended on main side, mirror it
+        if (u.isSubscribed && (u as any).premiumUntil) {
+          u.isSubscribed = false;
+          (u as any).premiumUntil = undefined;
+          savePlatformDB();
+        }
+      }
+    }
+  } catch(e) {}
+
   const modelExists = MODELS_INFO.some(m => m.id === u.activeModel);
   if (!modelExists) {
-    u.activeModel = "gemini-3.1-flash-lite";
+    u.activeModel = "gemini-3.1-pro-preview";
     savePlatformDB();
   }
   return u;
@@ -181,20 +466,25 @@ const checkPlatformLimit = (user: PlatformUser, modelId: string): { allowed: boo
     user.modelMessagesToday = {};
   }
   
+  const current = user.modelMessagesToday[modelId] || 0;
+  
   if (user.isSubscribed) {
-    return { allowed: true, limit: 99999, current: user.modelMessagesToday[modelId] || 0 };
+    return { allowed: true, limit: 99999, current };
   }
   
-  let limit = 100; // All OpenRouter models have a limit of 100 requests/day
+  let limit = 50; // Default limit for all models except specified Gemini and DeepSeek
   if (modelId === "gemini-3.5-flash") {
     limit = 5;
+  } else if (modelId === "gemini-3.1-pro-preview") {
+    limit = 5;
   } else if (modelId === "gemini-3.1-flash-lite") {
-    limit = 15;
-  } else if (modelId === "google/gemma-4-31b-it:free") {
-    limit = 50;
+    limit = 45;
+  } else if (modelId === "gemini-2.5-flash") {
+    limit = 45;
+  } else if (modelId === "deepseek-v4-flash" || modelId.toLowerCase().includes("deepseek")) {
+    limit = 20;
   }
-  
-  const current = user.modelMessagesToday[modelId] || 0;
+
   if (current >= limit) {
     return { allowed: false, limit, current };
   }
@@ -216,18 +506,90 @@ const handlePlatformInput = async (ctx: any, text: string) => {
      
      const mentionRegex = new RegExp(`@?${botUsername}`, 'ig');
      text = text.replace(mentionRegex, '').trim();
+
+     if (!text) {
+        text = "Привет!";
+     }
   }
 
   const u = getInitPlatformUser(ctx);
 
-  const upperText = (text || "").toUpperCase();
-  if (upperText.includes("MAXVERSTAPPENBEST") || upperText.includes("KOSTASDEBIL")) {
-     if (!u.isSubscribed) {
-       u.isSubscribed = true;
-       savePlatformDB();
-       await ctx.reply("✅ Промокод применен!\n\nВы получили статус PRO (1 месяц): переключайтесь на любые модели ИИ на платформе без ограничений на 30 дней.");
+  if (u.proRevoked) {
+     return ctx.reply("❌ Ваш доступ к PRO-режиму был отключен администратором за несоблюдение правил пользования сервисом на платформе.");
+  }
+
+  // Check if message text contains any valid promocode from promocodes.json or legacy ones
+  let matchedPromo = "";
+  const textToSearch = (text || "").toUpperCase();
+  if (textToSearch.includes("MAXVERSTAPPENBEST")) {
+     matchedPromo = "MAXVERSTAPPENBEST";
+  } else if (textToSearch.includes("KOSTASDEBIL")) {
+     matchedPromo = "KOSTASDEBIL";
+  } else {
+     const match = textToSearch.match(/WAI-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}/);
+     if (match) {
+        matchedPromo = match[0];
+     }
+  }
+
+  if (matchedPromo) {
+     const pFile = path.join(process.cwd(), "promocodes.json");
+     let isPromoActive = false;
+     let durationMonths = -1;
+     try {
+       if (fs.existsSync(pFile)) {
+         const pData = JSON.parse(fs.readFileSync(pFile, "utf-8"));
+         const promo = pData[matchedPromo];
+         if (promo) {
+           // Verify not used already if one-time
+           if (promo.type === "one_time" && promo.usedBy && promo.usedBy.length > 0) {
+              await ctx.reply("❌ Этот промокод уже был использован.");
+              return;
+           }
+           if (promo.usedBy && promo.usedBy.includes(ctx.from.id)) {
+              await ctx.reply("❌ Вы уже активировали этот промокод.");
+              return;
+           }
+           isPromoActive = true;
+           durationMonths = promo.durationMonths || -1;
+           
+           // Mark as used
+           promo.usedBy = promo.usedBy || [];
+           promo.usedBy.push(ctx.from.id);
+           fs.writeFileSync(pFile, JSON.stringify(pData, null, 2), "utf-8");
+         }
+       }
+     } catch (e) {
+       console.error("Error processing text promocode:", e);
+     }
+
+     if (isPromoActive) {
+        if (!u.isSubscribed) {
+          u.isSubscribed = true;
+          u.promoUsed = matchedPromo;
+          u.proRevoked = false;
+          savePlatformDB();
+          
+          // Sync to standard users.json if exists
+          try {
+            const uFile = path.join(process.cwd(), "users.json");
+            if (fs.existsSync(uFile)) {
+              const uData = JSON.parse(fs.readFileSync(uFile, "utf-8"));
+              if (uData[ctx.from.id]) {
+                uData[ctx.from.id].isSubscribed = true;
+                uData[ctx.from.id].promoUsed = matchedPromo;
+                uData[ctx.from.id].proRevoked = false;
+                fs.writeFileSync(uFile, JSON.stringify(uData, null, 2), "utf-8");
+              }
+            }
+          } catch (err) {}
+
+          await ctx.reply(`✅ Промокод ${matchedPromo} применен!\n\nВы получили БЕЗЛИМИТНЫЙ PRO статус на платформе: переключайтесь на любые модели ИИ без ограничений!`);
+        } else {
+          await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
+        }
      } else {
-       await ctx.reply("❕ Промокод уже был активирован, у вас уже есть PRO.");
+        await ctx.reply("❌ Промокод не найден, срок его действия истек или достигнут лимит использований.");
      }
      return;
   }
@@ -242,7 +604,7 @@ const handlePlatformInput = async (ctx: any, text: string) => {
        {
          parse_mode: "HTML",
          ...Markup.inlineKeyboard([
-           [Markup.button.callback("🌟 Купить PRO (100 Stars / мес)", "buy_pro")],
+           [Markup.button.callback("🌟 Купить PRO (150 Stars / 2 мес)", "buy_pro")],
            [Markup.button.url("🤖 Перейти в обычного бота", "https://t.me/WolffAI_bot")]
          ])
        }
@@ -256,9 +618,6 @@ const handlePlatformInput = async (ctx: any, text: string) => {
   savePlatformDB();
 
   const openrouterKey = process.env.OPENROUTER_API_KEY;
-  if (!openrouterKey) {
-     return ctx.reply("🔌 Ошибка: Администратор не установил OPENROUTER_API_KEY на сервере.");
-  }
 
   let statusMsg: any = null;
   try {
@@ -273,6 +632,14 @@ const handlePlatformInput = async (ctx: any, text: string) => {
 
   try {
      let textContent = text || "";
+     if (ctx.message?.reply_to_message) {
+        const replyTo = ctx.message.reply_to_message;
+        const replySender = replyTo.from?.first_name || (replyTo.from?.username ? `@${replyTo.from.username}` : "Пользователь");
+        const replyText = replyTo.text || replyTo.caption || "";
+        if (replyText) {
+           textContent = `[Контекст: Сообщение на которое ответил пользователь (Автор: ${replySender})]:\n"${replyText}"\n\n[Текст пользователя]:\n${textContent}`;
+        }
+     }
      let mediaData: { data: string; mimeType: string } | null = null;
 
      // Handle photos
@@ -349,7 +716,8 @@ const handlePlatformInput = async (ctx: any, text: string) => {
         }
      }
 
-     const chat = getActiveChat(u);
+     const isGroupChat = ctx.chat?.type !== 'private';
+     const chat = isGroupChat ? getGroupPlatformChat(ctx.chat.id) : getActiveChat(u);
      const isMultimodal = isMultimodalModel(u.activeModel);
      let userMsgContent: any = textContent;
 
@@ -382,68 +750,14 @@ const handlePlatformInput = async (ctx: any, text: string) => {
      }
 
       const generateModelContent = async (modelId: string, history: any[]): Promise<string> => {
-        if (modelId.startsWith("gemini-")) {
-          if (!aiClient) {
-            throw new Error("Официальный Google Gemini API не инициализирован. Проверьте GEMINI_API_KEY.");
-          }
-          const contents = historyToGeminiContents(history);
-          const geminiResponse = await withTimeout(
-            aiClient.models.generateContent({
-              model: modelId,
-              contents: contents,
-            }),
-            25000,
-            "Официальный Google Gemini API слишком долго отвечает."
-          );
-          const txt = geminiResponse.text || "";
-          if (!txt) {
-            throw new Error("Получен пустой ответ от Google Gemini API.");
-          }
-          return txt;
-        } else {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 seconds timeout
-          
-          try {
-            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${openrouterKey}`,
-                "Content-Type": "application/json",
-                "HTTP-Referer": process.env.APP_URL || "https://ais-dev.europe-west1.run.app",
-                "X-Title": "WolffAIPlatform"
-              },
-              body: JSON.stringify({
-                model: modelId,
-                messages: history
-              }),
-              signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-              const errText = await response.text();
-              throw new Error(`OpenRouter HTTP ${response.status}: ${errText}`);
-            }
-
-            const apiData: any = await response.json();
-            const txt = apiData.choices?.[0]?.message?.content || "";
-            if (!txt) {
-              throw new Error("Пустой ответ от OpenRouter API.");
-            }
-            return txt;
-          } catch (fetchErr: any) {
-            clearTimeout(timeoutId);
-            if (fetchErr.name === 'AbortError') {
-              throw new Error("OpenRouter отвечает слишком долго.");
-            }
-            throw fetchErr;
-          }
-        }
+        const result = await generateContentWithRetryAndFallback(modelId, history);
+        activeModelAttempt = result.actualModelUsed;
+        usedFallback = result.usedFallback;
+        return result.text;
       };
 
       let replyText = "";
-      let activeModelAttempt = (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') ? "gemini-3.1-flash-lite" : u.activeModel;
+      let activeModelAttempt = u.activeModel;
       let usedFallback = false;
       let fallbackErrorMsg = "";
 
@@ -452,21 +766,6 @@ const handlePlatformInput = async (ctx: any, text: string) => {
       } catch (genErr: any) {
         console.error(`First attempt to generate with model ${activeModelAttempt} failed:`, genErr);
         fallbackErrorMsg = genErr.message || String(genErr);
-         
-        // Define fallback candidates to guarantee all models work without exception
-        const fallbacks = [ "gemini-3.5-flash", "gemini-3.1-flash-lite", "google/gemma-4-31b-it:free", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-coder:free" ].filter(m => m !== u.activeModel);
-
-        for (const candidate of fallbacks) {
-          try {
-            console.log(`Starting fallback attempt with model: ${candidate}`);
-            replyText = await generateModelContent(candidate, chat.history);
-            activeModelAttempt = candidate;
-            usedFallback = true;
-            break;
-          } catch (fallbackErr) {
-            console.error(`Fallback model ${candidate} failed:`, fallbackErr);
-          }
-        }
 
         if (!replyText) {
           chat.history.pop();
@@ -482,27 +781,15 @@ const handlePlatformInput = async (ctx: any, text: string) => {
         }
       }
 
+
+      chat.history.push({ role: "assistant", content: replyText });
+      savePlatformDB();
+
       if (usedFallback) {
-        replyText += `\n\n⚠️ *Примечание: Исходная модель [${getModelFriendlyName(u.activeModel)}] оказалась временно недоступна. Автоматически применена резервная модель [${getModelFriendlyName(activeModelAttempt)}].*`;
+         replyText += `\n\n_⚠️ Первичная модель была недоступна. Использован автоматический резерв: ${getModelFriendlyName(activeModelAttempt)}_`;
       }
 
-
-     chat.history.push({ role: "assistant", content: replyText });
-     savePlatformDB();
-
-     if (statusMsg) {
-        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, replyText, { parse_mode: "Markdown" }).catch(async () => {
-           await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, replyText).catch(async () => {
-              await ctx.reply(replyText, { parse_mode: "Markdown" }).catch(async () => {
-                 await ctx.reply(replyText);
-              });
-           });
-        });
-     } else {
-        await ctx.reply(replyText, { parse_mode: "Markdown" }).catch(async () => {
-           await ctx.reply(replyText);
-        });
-     }
+      await sendRobustReply(ctx, replyText, statusMsg);
 
   } catch (err: any) {
      console.error("Platform Bot general handler error:", err);
@@ -536,7 +823,7 @@ export function initPlatformBot(app: express.Express) {
         username: "web_user",
         firstName: "Веб-Пользователь",
         joinedAt: new Date().toISOString(),
-        activeModel: "gemini-3.1-flash-lite",
+        activeModel: "gemini-3.1-pro-preview",
         chats: {
           [defaultChatId]: { id: defaultChatId, name: "Главный диалог", history: [] }
         },
@@ -547,10 +834,24 @@ export function initPlatformBot(app: express.Express) {
       };
       savePlatformDB();
     }
-    const u = platformUsers[userId];
+    
+  const u = platformUsers[userId];
+  
+  // Sync PRO status from main users.json
+  try {
+    const mainUsersStr = fs.readFileSync('users.json', 'utf8');
+    const mainUsers = JSON.parse(mainUsersStr);
+    if (mainUsers[userId] && (mainUsers[userId].isSubscribed || mainUsers[userId].role === 'admin')) {
+      if (!u.isSubscribed) {
+        u.isSubscribed = true;
+        savePlatformDB();
+      }
+    }
+  } catch(e) {}
+
     const modelExists = MODELS_INFO.some(m => m.id === u.activeModel);
     if (!modelExists) {
-      u.activeModel = "gemini-3.1-flash-lite";
+      u.activeModel = "gemini-3.1-pro-preview";
       savePlatformDB();
     }
     return u;
@@ -621,13 +922,10 @@ export function initPlatformBot(app: express.Express) {
     const openrouterKey = process.env.OPENROUTER_API_KEY;
     const u = getInitPlatformUserWeb(sessionId);
     
-    // Auto fallback to Gemini 3.5 Flash if OpenRouter key is missing and selected model is non-Gemini.
+    // Auto fallback to Gemini 3.5 Flash if selected model is wrong
     let currentModel = u.activeModel;
     let fallbackDueToNoKey = false;
-    if (!currentModel.startsWith("gemini-") && !openrouterKey) {
-      currentModel = "gemini-3.5-flash";
-      fallbackDueToNoKey = true;
-    }
+    // Key validation removed for robust fallback
 
     try {
       const limitCheck = checkPlatformLimit(u, currentModel);
@@ -665,57 +963,14 @@ export function initPlatformBot(app: express.Express) {
       }
 
       const generateModelContentWeb = async (modelId: string, history: any[]): Promise<string> => {
-        if (modelId.startsWith("gemini-")) {
-          if (!aiClient) {
-            throw new Error("Google Gemini API не инициализирован.");
-          }
-          const contents = historyToGeminiContents(history);
-          const geminiResponse = await withTimeout(
-            aiClient.models.generateContent({
-              model: modelId,
-              contents: contents,
-            }),
-            25000,
-            "Google Gemini API ответил тайм-аутом."
-          );
-          return geminiResponse.text || "";
-        } else {
-          if (!openrouterKey) {
-            throw new Error("OPENROUTER_API_KEY не задан.");
-          }
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 25000);
-          try {
-            const apiRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${openrouterKey}`,
-                "Content-Type": "application/json",
-                "HTTP-Referer": process.env.APP_URL || "https://ais-dev.europe-west1.run.app",
-                "X-Title": "WolffAIPlatform"
-              },
-              body: JSON.stringify({
-                model: modelId,
-                messages: history
-              }),
-              signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            if (!apiRes.ok) {
-              const errText = await apiRes.text();
-              throw new Error(`OpenRouter HTTP ${apiRes.status}: ${errText}`);
-            }
-            const apiData: any = await apiRes.json();
-            return apiData.choices?.[0]?.message?.content || "";
-          } catch (e) {
-            clearTimeout(timeoutId);
-            throw e;
-          }
-        }
+        const result = await generateContentWithRetryAndFallback(modelId, history);
+        activeModelAttempt = result.actualModelUsed;
+        usedFallback = result.usedFallback;
+        return result.text;
       };
 
       let replyText = "";
-      let activeModelAttempt = currentModel;
+      let activeModelAttempt = u.activeModel;
       let usedFallback = false;
       let fallbackErrorMsg = "";
 
@@ -725,18 +980,6 @@ export function initPlatformBot(app: express.Express) {
         console.error(`Web PlatformBot attempt failed with ${activeModelAttempt}:`, err);
         fallbackErrorMsg = err.message || String(err);
         
-        const fallbacks = ["gemini-3.5-flash", "gemini-3.1-flash-lite"].filter(m => m !== currentModel);
-        for (const candidate of fallbacks) {
-          try {
-            replyText = await generateModelContentWeb(candidate, chat.history);
-            activeModelAttempt = candidate;
-            usedFallback = true;
-            break;
-          } catch (fErr) {
-            console.error(`Fallback failed: ${candidate}`, fErr);
-          }
-        }
-
         if (!replyText) {
           chat.history.pop();
           savePlatformDB();
@@ -744,8 +987,9 @@ export function initPlatformBot(app: express.Express) {
         }
       }
 
-      if (usedFallback || fallbackDueToNoKey) {
-        replyText += `\n\n⚠️ *Примечание: Модель [${getModelFriendlyName(u.activeModel)}] требует настройки OpenRouter на сервере или временно недоступна. Автоматически применена модель [${getModelFriendlyName(activeModelAttempt)}].*`;
+
+      if (usedFallback) {
+         replyText += `\n\n_⚠️ Первичная модель была недоступна. Использован автоматический резерв: ${getModelFriendlyName(activeModelAttempt)}_`;
       }
 
       chat.history.push({ role: "assistant", content: replyText });
@@ -759,7 +1003,11 @@ export function initPlatformBot(app: express.Express) {
   });
 
   const isProd = process.env.NODE_ENV === "production";
-  const webhookDomain = isProd ? (process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app") : null;
+  const rawDomain = process.env.WEBHOOK_DOMAIN || process.env.APP_URL || "https://ais-pre-crxcvc7jvjmvqgisciea2c-529864647051.europe-west1.run.app";
+  const isAiStudioSandbox = rawDomain.includes("ais-dev-") || rawDomain.includes("ais-pre-");
+  // AI Studio preview/shared environments run behind auth which blocks Webhooks with a 302 Found redirect.
+  // Therefore, start Platform bot in Polling mode for preview and Webhook mode for real deployments.
+  const webhookDomain = (isProd && !isAiStudioSandbox) ? rawDomain : null;
   const token = process.env.PLATFORM_TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.log("PLATFORM_TELEGRAM_BOT_TOKEN missing in env.");
@@ -772,12 +1020,12 @@ export function initPlatformBot(app: express.Express) {
   const sendProInvoice = async (ctx: any) => {
     try {
       await ctx.replyWithInvoice({
-        title: "🌟 Подписка PRO (1 месяц)",
-        description: "Безлимитный доступ ко всем ИИ-моделям на платформе WolffAIPlatform на 30 дней.",
+        title: "🌟 Подписка PRO (2 месяца)",
+        description: "Безлимитный доступ на 2 месяца ко всей экосистеме ботов Wolff AI (Мультимодельная платформа WolffAI Platform, Базовый WolffAI, Злой AngryAI). Оплата Telegram Stars.",
         payload: "platform_pro_1_month",
         provider_token: "", // Пустой токен для Telegram Stars
         currency: "XTR",
-        prices: [{ label: "PRO Подписка 1 месяц", amount: 100 }]
+        prices: [{ label: "PRO Подписка 2 месяца", amount: 150 }]
       });
     } catch (err: any) {
       console.error("Error sending invoice:", err);
@@ -793,28 +1041,31 @@ export function initPlatformBot(app: express.Express) {
   bot.start((ctx) => {
     const u = getInitPlatformUser(ctx);
     ctx.reply(
-      `👋 Привет, ${ctx.from.first_name}!\n\n` +
+      `👋 Привет, ${ctx.from.first_name}!${u.isSubscribed ? ' 💎 <b>[PRO]</b>' : ''}\n\n` +
       `Добро пожаловать на мультимодельную платформу <b>WolffAIPlatform</b>!\n\n` +
       `Здесь вы можете переключаться между лучшими языковыми моделями мира, изолированными друг от друга:\n` +
-      `🤖 <b>Gemini 3.5 Flash, Gemini 3.1 Flash Lite, Gemma 4 31B, Llama 3.3 70B, Hermes 405B</b> и другими передовыми моделями!\n\n` +
+      `🤖 <b>Gemini 3.5 Flash, Gemini 3.1 Pro, Llama 3.3 70B, Hermes 405B, Qwen, Nemotron, DeepSeek</b> и другими передовыми моделями!\n\n` +
       `⚠️ <b>Дневные лимиты для бесплатного аккаунта:</b>\n` +
       `• Gemini 3.5 Flash: <b>5 запросов</b>\n` +
-      `• Gemini 3.1 Flash Lite: <b>15 запросов</b>\n` +
-      `• Gemma 4 31B: <b>50 запросов</b>\n` +
-      `• Остальные OpenRouter модели (Llama 3.3, Hermes 3 и др.): <b>100 запросов</b>\n\n` +
-      `🌟 Оформите <b>PRO подписку на 1 месяц за 100 звезд (Telegram Stars)</b> для полной отмены лимитов или продолжайте пользоваться бесплатным стандартным ИИ-ботом.\n\n` +
+      `• Gemini 3.1 Pro: <b>5 запросов</b>\n` +
+      `• Gemini 3.1 Flash Lite: <b>45 запросов</b>\n` +
+      `• Модели DeepSeek: <b>20 запросов</b>\n` +
+      `• Все остальные модели: <b>50 запросов</b>\n\n` +
+      `🌟 Оформите <b>PRO подписку на 2 месяца за 150 звезд</b>. При покупке PRO вы получаете безлимитный доступ ко всей экосистеме ботов с ИИ: Мультимодельная платформа (WolffAI Platform), Базовый бот (WolffAI) и Злой бот (AngryAI)!\n\n` +
       `🛠️ <b>Основные команды:</b>\n` +
       `🤖 /models — Выбрать активную ИИ-модель\n` +
       `🧹 /clear — Сбросить диалог и историю контекста\n` +
       `📈 /status — Показать лимиты и текущую модель\n` +
-      `💳 /buypro — Купить PRO подписку (100 Stars / мес)\n` +
+      `➕ /newchat [название] — Создать новый отдельный чат\n` +
+      `📂 /chats — Показать список ваших чатов\n` +
+      `💳 /buypro — Купить PRO подписку (150 Stars / 2 мес)\n` +
       `🔑 /promo [код] — Ввести промокод на скидку/активацию\n\n` +
       `Присылайте любые вопросы, фото, стикеры или гифки! 👇`,
       {
         parse_mode: "HTML",
         ...Markup.inlineKeyboard([
           [Markup.button.callback("🤖 Выбрать модель", "show_models_list")],
-          [Markup.button.callback("🌟 Купить PRO (100 Stars)", "buy_pro")],
+          [Markup.button.callback("🌟 Купить PRO (150 Stars)", "buy_pro")],
           [Markup.button.url("🤖 Обычный бот", "https://t.me/WolffAI_bot")]
         ])
       }
@@ -827,15 +1078,68 @@ export function initPlatformBot(app: express.Express) {
       const text = (ctx.message as any)?.text || "";
       const parts = text.split(/\s+/).filter((p: string) => p.trim() !== "");
       if (parts.length < 2) return ctx.reply("❌ Введите промокод, например: /promo CODE");
+
+      const code = parts.slice(1).join("").trim().toUpperCase();
       
-      const code = parts.slice(1).join("").toUpperCase();
-      if (code.includes("MAXVERSTAPPENBEST") || code.includes("KOSTASDEBIL")) {
+      let isValid = false;
+      let durationMonths = -1;
+      let isHardcoded = false;
+      let promoData: any = null;
+      
+      if (code === "MAXVERSTAPPENBEST" || code === "KOSTASDEBIL") {
+        isValid = true;
+        isHardcoded = true;
+      } else {
+        const result = await activatePromo(code, ctx.from.id);
+        if (result.success) {
+          isValid = true;
+          promoData = result.promo;
+          durationMonths = promoData.durationMonths || -1;
+        } else {
+          return ctx.reply(`❌ ${result.error}`);
+        }
+      }
+
+      if (isValid) {
          if (!u.isSubscribed) {
-           u.isSubscribed = true;
+           let durationLabel = "";
+           if (durationMonths === -1) {
+             u.isSubscribed = true;
+             (u as any).premiumUntil = undefined;
+             durationLabel = "бессрочно (навсегда)";
+           } else {
+             u.isSubscribed = true;
+             const expiryDate = new Date();
+             expiryDate.setMonth(expiryDate.getMonth() + durationMonths);
+             (u as any).premiumUntil = expiryDate.toISOString();
+             durationLabel = `на ${durationMonths} мес. (до ${expiryDate.toLocaleDateString('ru-RU')})`;
+           }
+           u.promoUsed = code;
+           u.proRevoked = false;
            savePlatformDB();
-           await ctx.reply("✅ Промокод успешно применен!\n\nВы получили статус PRO (1 месяц): все модели ИИ теперь доступны полностью без ограничений на 30 дней.");
+           
+           // Sync dynamic Promo back to users.json
+           try {
+             const uFile = 'users.json';
+             if (fs.existsSync(uFile)) {
+               const uData = JSON.parse(fs.readFileSync(uFile, "utf-8"));
+               if (uData[ctx.from.id]) {
+                 uData[ctx.from.id].isSubscribed = true;
+                 uData[ctx.from.id].promoUsed = code;
+                 uData[ctx.from.id].proRevoked = false;
+                 if (durationMonths !== -1) {
+                   uData[ctx.from.id].premiumUntil = (u as any).premiumUntil;
+                 }
+                 fs.writeFileSync(uFile, JSON.stringify(uData, null, 2), "utf-8");
+               }
+             }
+           } catch(syncErr) {
+             console.error("Sync to main users during promo check error:", syncErr);
+           }
+
+           await ctx.reply(`✅ Промокод применен!\n\nВы получили PRO статус ${durationLabel}: все модели ИИ теперь доступны полностью без ограничений.`);
          } else {
-           await ctx.reply("❕ Промокод уже был активирован, у вас уже есть статус PRO.");
+           await ctx.reply("❕ У вас уже есть статус PRO. Чтобы применить новый код, текущий статус должен закончиться.");
          }
       } else {
          await ctx.reply(`❌ Промокод не найден или устарел. Проверьте правильность ввода.`);
@@ -845,69 +1149,221 @@ export function initPlatformBot(app: express.Express) {
     }
   });
 
-  bot.command("buypro", sendProInvoice);
-  bot.action("buy_pro", sendProInvoice);
-
-  bot.action("show_models_list", (ctx) => {
-    ctx.answerCbQuery().catch(()=>{});
-    const u = getInitPlatformUser(ctx);
-    const buttons = MODELS_INFO.map(m => {
-      const activeIndicator = u.activeModel === m.id ? "✅ " : "   ";
-      // Use index instead of ID to avoid 64-byte limit in Telegram callback data
-      const mIndex = MODELS_INFO.findIndex(mi => mi.id === m.id);
-      return [Markup.button.callback(`${activeIndicator}${m.name}`, `set_model:${mIndex}`)];
-    });
-
-    ctx.reply(
-      `🤖 <b>Выбор ИИ Модели:</b>\n\n` +
-      MODELS_INFO.map(m => `• <b>${m.name}</b>: ${m.desc}`).join("\n\n") + 
-      `\n\nВыберите модель из списка на клавиатуре ниже для переключения:`,
-      {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard(buttons)
+  const sendPlatformPaymentMenu = async (ctx: any) => {
+    try {
+      const u = getInitPlatformUser(ctx);
+      if (u.isSubscribed) {
+        return ctx.reply("💎 У вас уже активирован PRO статус! Вы пользуетесь ботом без ограничений.");
       }
-    ).catch(console.error);
+      await ctx.reply(
+        `💳 <b>Оплата PRO подписки (2 месяца)</b>\n\n` +
+        `Вы получите безлимитный PRO статус ко всей экосистеме Wolff AI на 2 месяца (Мультимодельная платформа WolffAI Platform, Базовый WolffAI, Злой AngryAI).\n\n` +
+        `Оплата производится через Telegram Stars (150 ★).\n\n` +
+        `<i>Для оплаты нажмите кнопку ниже:</i>`,
+        {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("🌟 Оплатить (150 Stars / 2 мес)", "platform_buy_stars")]
+          ])
+        }
+      );
+    } catch (err) {
+      console.error("sendPlatformPaymentMenu Error:", err);
+    }
+  };
+
+  bot.command("buypro", sendPlatformPaymentMenu);
+  bot.action("buy_pro", sendPlatformPaymentMenu);
+
+  bot.action("platform_buy_stars", async (ctx) => {
+    try {
+      const u = getInitPlatformUser(ctx);
+      if (u.isSubscribed) {
+        await ctx.answerCbQuery("У вас уже есть PRO!").catch(()=>{});
+        return ctx.reply("💎 У вас уже активирован PRO статус!");
+      }
+      await ctx.answerCbQuery().catch(()=>{});
+      await ctx.replyWithInvoice({
+        title: "🌟 Подписка PRO (2 месяца)",
+        description: "Безлимитный доступ на 2 месяца ко всей экосистеме ботов Wolff AI (Мультимодельная платформа WolffAI Platform, Базовый WolffAI, Злой AngryAI). Оплата Telegram Stars.",
+        payload: "platform_pro_2_months",
+        provider_token: "", // Пустой токен для Telegram Stars
+        currency: "XTR",
+        prices: [{ label: "PRO Подписка 2 месяца", amount: 150 }]
+      }).catch(async (err) => {
+        console.error("Error sending platform invoice:", err);
+        await ctx.reply(
+          "❌ Не удалось создать официальный счет на оплату через Telegram Stars.\n" +
+          "Вы можете использовать промокоды для мгновенной PRO-активации!",
+          { parse_mode: "HTML" }
+        );
+      });
+    } catch (err) {
+      console.error("platform_buy_stars action error:", err);
+    }
   });
 
-  bot.command("models", (ctx) => {
+  bot.action("platform_buy_sbp", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(()=>{});
+      await ctx.reply(
+        `❌ Этот способ оплаты более недоступен.\n\nПожалуйста, воспользуйтесь оплатой через 🌟 <b>Telegram Stars</b>. Введите команду /buypro для проведения оплаты.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err) {
+      console.error("platform_buy_sbp action error:", err);
+    }
+  });
+
+  bot.action("platform_buy_crypto", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(()=>{});
+      await ctx.reply(
+        `❌ Этот способ оплаты более недоступен.\n\nПожалуйста, воспользуйтесь оплатой через 🌟 <b>Telegram Stars</b>. Введите команду /buypro для проведения оплаты.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err) {
+      console.error("platform_buy_crypto action error:", err);
+    }
+  });
+
+  bot.action("platform_buy_inter", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(()=>{});
+      await ctx.reply(
+        `❌ Этот способ оплаты более недоступен.\n\nПожалуйста, воспользуйтесь оплатой через 🌟 <b>Telegram Stars</b>. Введите команду /buypro для проведения оплаты.`,
+        { parse_mode: "HTML" }
+      );
+    } catch (err) {
+      console.error("platform_buy_inter action error:", err);
+    }
+  });
+
+  const showModelsMenu = async (ctx: any) => {
     const u = getInitPlatformUser(ctx);
     const buttons = MODELS_INFO.map(m => {
       const activeIndicator = u.activeModel === m.id ? "✅ " : "   ";
-      // Use index instead of ID to avoid 64-byte limit in Telegram callback data
       const mIndex = MODELS_INFO.findIndex(mi => mi.id === m.id);
       return [Markup.button.callback(`${activeIndicator}${m.name}`, `set_model:${mIndex}`)];
     });
 
-    ctx.reply(
-      `🤖 <b>Выбор ИИ Модели:</b>\n\n` +
+    const text = `🤖 <b>Выбор ИИ Модели:</b>${u.isSubscribed ? ' 💎 <b>[PRO]</b>' : ''}\n\n` +
+      `👉 <b>Текущая модель:</b> <code>${getModelFriendlyName(u.activeModel)}</code>\n\n` +
       MODELS_INFO.map(m => `• <b>${m.name}</b>: ${m.desc}`).join("\n\n") + 
-      `\n\nВыберите модель из списка на клавиатуре ниже для переключения:`,
-      {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard(buttons)
-      }
-    ).catch(console.error);
+      `\n\nВыберите модель из списка на клавиатуре ниже для переключения:`;
+
+    const extra = {
+      parse_mode: "HTML" as const,
+      ...Markup.inlineKeyboard(buttons)
+    };
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, extra).catch(async () => {
+        await ctx.reply(text, extra).catch(console.error);
+      });
+    } else {
+      await ctx.reply(text, extra).catch(console.error);
+    }
+  };
+
+  bot.action("show_models_list", async (ctx) => {
+    await ctx.answerCbQuery().catch(()=>{});
+    await showModelsMenu(ctx);
+  });
+
+  bot.command("models", async (ctx) => {
+    await showModelsMenu(ctx);
   });
 
   bot.action(/set_model:(.+)/, async (ctx) => {
-    const modelIndex = parseInt(ctx.match[1], 10);
-    const model = MODELS_INFO[modelIndex]?.id;
-    if (!model) {
-       ctx.answerCbQuery("Ошибка: Модель не найдена.").catch(()=>{});
-       return;
-    }
-    const u = getInitPlatformUser(ctx);
-    u.activeModel = model;
-    savePlatformDB();
-    const modelName = getModelFriendlyName(model);
     try {
-      await ctx.answerCbQuery(`Выбран ИИ: ${modelName}`);
-    } catch {}
-    await ctx.editMessageText(
-      `✅ Вы переключились на модель: <b>${modelName}</b>\n\n` +
-      `Контекст диалога полностью изолирован. Можете присылать свои вопросы, фотографии, стикеры или GIF напрямую в чат!`,
-      { parse_mode: "HTML" }
-    ).catch(console.error);
+      let matchVal: string | null = null;
+      const callbackData = (ctx.callbackQuery as any)?.data || "";
+      if (callbackData.startsWith("set_model:")) {
+        matchVal = callbackData.split(":")[1];
+      }
+      if (!matchVal && (ctx as any).match) {
+        matchVal = typeof (ctx as any).match === 'string' ? ((ctx as any).match as string).split(':')[1] : (ctx as any).match[1];
+      }
+      if (!matchVal) {
+        await ctx.answerCbQuery("Ошибка выбора модели.").catch(()=>{});
+        return;
+      }
+      const modelIndex = parseInt(matchVal, 10);
+      const model = MODELS_INFO[modelIndex]?.id;
+      if (!model) {
+        await ctx.answerCbQuery("Ошибка: Модель не найдена.").catch(()=>{});
+        return;
+      }
+      
+      const modelName = getModelFriendlyName(model);
+
+      const u = getInitPlatformUser(ctx);
+      u.activeModel = model;
+      savePlatformDB();
+
+      // Answer instantly to eliminate any lag or loading state spinner
+      await ctx.answerCbQuery(`Выбран ИИ: ${modelName}`).catch(()=>{});
+
+      // Refresh the models list immediately so the checkmark moves to the newly chosen model!
+      await showModelsMenu(ctx);
+    } catch (err) {
+      console.error("set_model callback error:", err);
+      try {
+        await ctx.answerCbQuery("Ошибка выбора модели.").catch(()=>{});
+      } catch {}
+    }
+  });
+
+  bot.command("newchat", async (ctx) => {
+    try {
+      const u = getInitPlatformUser(ctx);
+      const text = (ctx.message as any)?.text || "";
+      const parts = text.split(" ");
+      parts.shift(); // remove command
+      const name = parts.length > 0 ? parts.join(" ") : `Чат ${Object.keys(u.chats).length + 1}`;
+      
+      const newId = Date.now().toString();
+      u.chats[newId] = { id: newId, name, history: [] };
+      u.currentChatId = newId;
+      savePlatformDB();
+      await ctx.reply(`✅ Создан и выбран новый чат в WolffAIPlatform: <b>${name}</b>`, { parse_mode: "HTML" });
+    } catch (err) {
+      console.error("Platform New Chat Error:", err);
+    }
+  });
+
+  bot.command("chats", async (ctx) => {
+    try {
+      const u = getInitPlatformUser(ctx);
+      const chatList = Object.values(u.chats).slice(-20); // show up to 20 recent chats
+      
+      const buttons = chatList.map(c => {
+         const prefix = c.id === u.currentChatId ? "👉 " : "";
+         return [Markup.button.callback(`${prefix}${c.name}`, `platform_switchchat_${c.id}`)];
+      });
+      
+      await ctx.reply(`Ваши активные чаты на WolffAIPlatform (текущий выделен):`, Markup.inlineKeyboard(buttons));
+    } catch (err) {
+      console.error("Platform Chats Error:", err);
+    }
+  });
+
+  bot.action(/platform_switchchat_(.*)/, async (ctx) => {
+    try {
+      const u = getInitPlatformUser(ctx);
+      const chatId = ctx.match[1];
+      if (u.chats[chatId]) {
+         u.currentChatId = chatId;
+         savePlatformDB();
+         await ctx.answerCbQuery(`Чат переключен на ${u.chats[chatId].name}`).catch(()=>{});
+         await ctx.editMessageText(`✅ Вы переключились на чат на WolffAIPlatform: <b>${u.chats[chatId].name}</b>`, { parse_mode: "HTML" }).catch(()=>{});
+      } else {
+         await ctx.answerCbQuery("Чат не найден").catch(()=>{});
+      }
+    } catch (err) {
+      console.error("Platform Switch Chat Error:", err);
+    }
   });
 
   bot.command("clear", (ctx) => {
@@ -940,7 +1396,7 @@ export function initPlatformBot(app: express.Express) {
     const text = `🤖 <b>Ваш статус на WolffAIPlatform:</b>\n\n` +
       `• <b>Активная модель:</b> ${getModelFriendlyName(u.activeModel)}\n` +
       `• <b>Использовано на этой модели сегодня:</b> ${limitText}\n` +
-      `• <b>Статус PRO:</b> ${u.isSubscribed ? "✅ Активен (Безлимит)" : "❌ Отсутствует (Подписка PRO: 100 Stars / мес)"}`;
+      `• <b>Статус PRO:</b> ${u.isSubscribed ? "✅ Активен (Безлимит)" : "❌ Отсутствует (Подписка PRO: 150 Stars / 2 мес)"}`;
 
     if (u.isSubscribed) {
       ctx.reply(text, { parse_mode: "HTML" }).catch(console.error);
@@ -948,7 +1404,7 @@ export function initPlatformBot(app: express.Express) {
       ctx.reply(text, {
         parse_mode: "HTML",
         ...Markup.inlineKeyboard([
-          [Markup.button.callback("🌟 Активировать PRO (100 Stars / мес)", "buy_pro")],
+          [Markup.button.callback("🌟 Активировать PRO (150 Stars / 2 мес)", "buy_pro")],
           [Markup.button.url("🤖 Перейти в обычного бота", "https://t.me/WolffAI_bot")]
         ])
       }).catch(console.error);
@@ -967,6 +1423,7 @@ export function initPlatformBot(app: express.Express) {
     try {
       const u = getInitPlatformUser(ctx);
       u.isSubscribed = true;
+      u.proRevoked = false;
       savePlatformDB();
       await ctx.reply(
         "🎉 <b>Оплата успешно подтверждена!</b>\n\n" +
@@ -1021,14 +1478,26 @@ export function initPlatformBot(app: express.Express) {
     };
   };
 
-  const stopBot = startBotPolling(bot);
-
-  process.once("SIGINT", () => {
-    stopBot();
-    bot.stop("SIGINT");
-  });
-  process.once("SIGTERM", () => {
-    stopBot();
-    bot.stop("SIGTERM");
-  });
+  if (webhookDomain) {
+    const cleanUrl = webhookDomain.endsWith("/") ? webhookDomain.slice(0, -1) : webhookDomain;
+    const webhookUrl = `${cleanUrl}/webhook/platform`;
+    console.log(`[Platform Bot] Registering Webhook: ${webhookUrl}`);
+    bot.telegram.setWebhook(webhookUrl).catch(e => {
+      console.error("[Platform Bot] Failed to set Webhook, falling back to polling:", e);
+      startBotPolling(bot);
+    });
+    app.post("/webhook/platform", (req, res) => {
+      bot.handleUpdate(req.body, res);
+    });
+  } else {
+    const stopBot = startBotPolling(bot);
+    process.once("SIGINT", () => {
+      stopBot();
+      bot.stop("SIGINT");
+    });
+    process.once("SIGTERM", () => {
+      stopBot();
+      bot.stop("SIGTERM");
+    });
+  }
 }

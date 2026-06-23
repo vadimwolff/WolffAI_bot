@@ -14,7 +14,7 @@ export const dbChats = pgTable("chats", {
   botType: text("bot_type").notNull(), // "wolff" | "angry" | "platform"
   name: text("name").notNull(),
   mode: text("mode").notNull().default("fast"), // "fast" | "thinking" | "search"
-  model: text("model").notNull().default("gemini-3.1-flash-lite"), // Platform active model
+  model: text("model").notNull().default("gemini-2.5-pro"), // Platform active model
   history: jsonb("history").notNull().default([]), // The history array
   updatedAt: timestamp("updated_at").defaultNow(),
 });
