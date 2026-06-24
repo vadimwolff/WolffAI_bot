@@ -340,17 +340,17 @@ async function generateContentWithRetryAndFallback(modelId: string, history: any
 }
 
 const MODELS_INFO = [
-  { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", desc: "Ультрабыстрый мультимодальный флагман Google.", multimodal: true },
-  { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", desc: "Сверхмощная экспериментальная модель Google.", multimodal: true },
-  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", desc: "Надежная быстрая мультимодальная модель.", multimodal: true },
-  { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", desc: "Супер-быстрая и легкая версия Gemini. (Резервная)", multimodal: true },
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (OpenModel)", desc: "Быстрая и эффективная модель следующего поколения от OpenModel.", multimodal: false },
-  { id: "meta-llama/llama-3.3-70b-instruct:free", name: "Llama 3.3 70B", desc: "Мощная открытая модель от Meta.", multimodal: false },
-  { id: "nousresearch/hermes-3-llama-3.1-405b:free", name: "Hermes 3 405B", desc: "Сверхмощная открытая модель от NousResearch.", multimodal: false },
-  { id: "qwen/qwen3-coder:free", name: "Qwen 3 Coder", desc: "Продвинутая модель для написания кода.", multimodal: false },
-  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", desc: "Открытая текстовая модель от Google (OpenRouter).", multimodal: false },
-  { id: "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", name: "Dolphin Mistral 24B", desc: "Модель без цензуры (Venice Edition).", multimodal: false },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 30B", desc: "Reasoning модель от Nvidia.", multimodal: false }
+  { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", desc: "Новейший ультрабыстрый мультимодальный флагман от Google. Разработан для молниеносной обработки текста, кода, изображений и видео. Идеально подходит для сложных, динамичных задач, требующих высокой скорости и превосходного качества ответа.", multimodal: true },
+  { id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", desc: "Сверхмощная экспериментальная модель Google. Обладает гигантским контекстным окном, феноменальными способностями к глубокому логическому анализу (reasoning) и способна обрабатывать целые книги, огромные кодовые базы и сложные многосоставные запросы с абсолютной точностью.", multimodal: true },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", desc: "Надежная и быстрая мультимодальная модель предыдущего поколения. Отлично справляется с повседневными запросами, переводами, анализом изображений и генерацией текста с минимальной задержкой.", multimodal: true },
+  { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", desc: "Супер-быстрая и легковесная версия Gemini. Оптимизирована для базовых задач, коротких диалогов и моментальных ответов. Используется в качестве безотказной резервной модели.", multimodal: true },
+  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", desc: "Передовая языковая модель следующего поколения. Показывает выдающиеся результаты в программировании, математике и логике, составляя сильную конкуренцию крупнейшим проприетарным ИИ. Предоставляется через провайдера OpenModel.", multimodal: false },
+  { id: "meta-llama/llama-3.3-70b-instruct:free", name: "Llama 3.3 70B", desc: "Мощнейшая открытая ИИ-модель от Meta (70 млрд параметров). Отлично понимает контекст, обладает богатой эрудицией и выдает развернутые, естественные и очень человечные тексты.", multimodal: false },
+  { id: "nousresearch/hermes-3-llama-3.1-405b:free", name: "Hermes 3 405B", desc: "Тяжеловесная открытая модель от NousResearch (405 млрд параметров), основанная на Llama 3.1. Обеспечивает колоссальную глубину знаний, экспертный анализ данных и способна решать архитектурные задачи высочайшей сложности.", multimodal: false },
+  { id: "qwen/qwen3-coder:free", name: "Qwen 3 Coder", desc: "Специализированный ИИ для разработчиков. Идеально пишет код, находит баги, рефакторит сложные функции и поддерживает множество языков программирования. Лучший выбор для программистов.", multimodal: false },
+  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", desc: "Новейшая открытая текстовая модель от Google, созданная на технологиях Gemini. Легкая, но крайне «умная» нейросеть, идеальная для написания статей, саммаризации и креативных текстов.", multimodal: false },
+  { id: "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", name: "Dolphin Mistral 24B", desc: "Полностью свободная модель без встроенной цензуры и жестких ограничений (Venice Edition). Полезна для авторов, ролевиков и тестировщиков безопасности, которым требуется максимальная свобода генерации.", multimodal: false },
+  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 30B", desc: "Продвинутая reasoning-модель от Nvidia. Сконструирована для построения длинных цепочек размышлений, решения сложных математических задач и аналитики, требующей глубокого пошагового логического вывода.", multimodal: false }
 ];
 
 const getInitPlatformUser = (ctx: any): PlatformUser => {

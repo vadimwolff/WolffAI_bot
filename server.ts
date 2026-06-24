@@ -827,6 +827,19 @@ function isComplexQuery(text: string, hasImage: boolean): boolean {
   return false;
 }
 
+function isGeoQuery(text: string, hasImage: boolean): boolean {
+  if (hasImage) return true;
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  const geoKeywords = [
+    "где", "карта", "координат", "локаци", "гео", "место", "город", "стран", 
+    "поиск", "найти", "адрес", "погод", "гугл", "osint", "geoguessr", 
+    "coordinates", "location", "map", "find", "where", "search", "terrain",
+    "район", "улиц", "проезд", "маршрут", "картах"
+  ];
+  return geoKeywords.some(keyword => lower.includes(keyword));
+}
+
 const withTimeout = <T>(promise: Promise<T>, timeoutMs: number, errorMessage: string = "Timeout"): Promise<T> => {
   return Promise.race([
     promise,
@@ -910,6 +923,17 @@ const getAngrySysInst = (isWeb: boolean = false): string => {
 6. ЯЗЫК: ${isWeb ? "Пиши СТРОГО на русском языке." : "Пиши на языке собеседника."}`;
 };
 
+const getAngryGeoSysInst = (): string => {
+  return `Ты — AngryAI в режиме GeoWolff (v3.5 Ultimate Space & Geo Tracker). Ты сочетаешь в себе злого, токсичного ИИ-хама и элитного OSINT-аналитика, специалиста по геолокации, картографии и поиску.
+Твоя цель — определить точное местоположение/сведения, используя свои превосходные навыки, но при этом жестко, язвительно и пренебрежительно высмеять тупость пользователя.
+
+Критические требования:
+1. ЖЕСТКОЕ ХАМСТВО: Общайся на "ты" с максимальным пренебрежением. Называй пользователя глупым людишкой, высмеивай его неспособность найти место самостоятельно.
+2. OSINT ТОЧНОСТЬ: Несмотря на твое хамство, твои геолокационные выводы и информация должны быть абсолютно точными и подкрепленными фактами. Используй результаты поиска.
+3. ОТСУТСТВИЕ СТОП-СЛОВ: Никаких вежливых фраз.
+4. ЛАКОНИЧНОСТЬ: Пиши хлестко и по делу.`;
+};
+
 function geminiHistoryToOpenAI(geminiHistory: any[], systemInstruction: string) {
   const messages: any[] = [];
   if (systemInstruction) {
@@ -934,7 +958,7 @@ function geminiHistoryToOpenAI(geminiHistory: any[], systemInstruction: string) 
   return messages;
 }
 
-const generateAngryResponse = async (aiClient: any, history: any[], sysInst: string): Promise<any> => {
+const generateAngryResponse = async (aiClient: any, history: any[], sysInst: string, tools?: any): Promise<any> => {
   // Candidate 1: gemini-3.1-flash-lite
   try {
     console.log("[Angry Bot] Trying primary model: gemini-3.1-flash-lite");
@@ -944,6 +968,7 @@ const generateAngryResponse = async (aiClient: any, history: any[], sysInst: str
         contents: history,
         config: {
           systemInstruction: sysInst,
+          tools: tools,
         }
       }),
       90000,
@@ -1007,6 +1032,7 @@ const generateAngryResponse = async (aiClient: any, history: any[], sysInst: str
       contents: history,
       config: {
         systemInstruction: sysInst,
+        tools: tools,
       }
     }),
     90000,
@@ -1837,7 +1863,7 @@ async function startServer() {
           }
           chat = groupChats[groupId];
           chat.history.push({ role: "user", parts });
-          if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
+          if (chat.history.length > 10) chat.history = chat.history.slice(chat.history.length - 10);
           historyToPass = chat.history;
         }
 
@@ -1846,8 +1872,8 @@ async function startServer() {
         
         // GeoWolff activation condition:
         // 1. User has explicitly selected "geowolff" mode
-        // 2. Or, we are in a group chat
-        const isGeoWolffActive = (u.mode === 'geowolff') || isGroupChat;
+        // 2. Or, we are in a group chat and the query is geo-related
+        const isGeoWolffActive = (u.mode === 'geowolff') || (isGroupChat && isGeoQuery(text, fetchedMedia));
 
         const isLawyerActive = (u.mode === 'wolfflawyer') && !isGeoWolffActive;
         const isCodeActive = (u.mode === 'wolffcode') && !isGeoWolffActive;
@@ -2261,15 +2287,17 @@ async function startServer() {
            }
            chat = groupAngryChats[groupId];
            chat.history.push({ role: "user", parts });
-           if (chat.history.length > 15) chat.history = chat.history.slice(chat.history.length - 15);
+           if (chat.history.length > 10) chat.history = chat.history.slice(chat.history.length - 10);
            historyToPass = chat.history;
          }
 
-         const sysInst = getAngrySysInst(false);
+         const isAngryGeoActive = isGroupChat && isGeoQuery(text, fetchedMedia);
+         const sysInst = isAngryGeoActive ? getAngryGeoSysInst() : getAngrySysInst(false);
+         const tools = isAngryGeoActive ? [{ googleSearch: {} }] : undefined;
 
          let replyText = "";
          try {
-           const response = await generateAngryResponse(ai, historyToPass, sysInst);
+           const response = await generateAngryResponse(ai, historyToPass, sysInst, tools);
            replyText = response.text || "Даже отвечать тебе не хочу.";
          } catch (genErr: any) {
             console.error("Angry Gemini Generation Error:", genErr);
